@@ -1,5 +1,4 @@
 hyper - a : open -a Calendar
-hyper - d : /Users/thomas/bin/toggle_mute.sh
 hyper - e : open -a Safari
 hyper - g : open -a Notes
 hyper - h : open -a /Users/thomas/Applications/Home\ Assistant.app
