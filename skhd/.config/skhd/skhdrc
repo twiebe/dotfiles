@@ -1,0 +1,19 @@
+hyper - a : open -a Calendar
+hyper - d : /Users/thomas/bin/toggle_mute.sh
+hyper - e : open -a Safari
+hyper - g : open -a Notes
+hyper - h : open -a /Users/thomas/Applications/Home\ Assistant.app
+hyper - i : shortcuts run "Switch Audio to Speakers"
+hyper - k : shortcuts run "Switch Audio to Microphone w Speaker Output"
+hyper - l : shortcuts run "Switch Audio to Microphone w Airpods Output"
+hyper - m : open -a Mail
+hyper - n : open -a Affine
+hyper - o : shortcuts run "Switch Audio to Airpods"
+hyper - p : open -a Maps
+hyper - s : open -a Signal
+hyper - t : open -a iTerm
+hyper - u : open -a Music
+hyper - v : open ~/Downloads
+hyper - w : open -a "Google Chrome"
+hyper - y : open -a WhatsApp
+hyper - z : open -a Zed
