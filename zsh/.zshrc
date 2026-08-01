@@ -4,13 +4,14 @@ export PATH="${HOME}/bin:${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
 export ZSH="$HOME/.oh-my-zsh"
 plugins=(git sudo tmux)
 zstyle ':omz:update' mode disabled
-source $ZSH/oh-my-zsh.sh
 
 # starship
 if which starship 2>&1 > /dev/null; then
+  source $ZSH/oh-my-zsh.sh
   eval "$(starship init zsh)"
 else
   ZSH_THEME="refined"
+  source $ZSH/oh-my-zsh.sh
 fi
 
 # opts
