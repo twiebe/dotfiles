@@ -1,3 +1,5 @@
+export PATH="${HOME}/bin:${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
+
 # oh-my-zsh
 export ZSH="$HOME/.oh-my-zsh"
 plugins=(git sudo tmux)
