@@ -3,10 +3,10 @@ return {
   opts = {
     picker = {
       sources = {
-        explorer = {
-          hidden = true, -- .dotfiles
-          ignored = true, -- optional: auch gitignored
-        },
+        explorer = { hidden = true, ignored = true },
+        files = { hidden = true, ignored = true },
+        smart = { hidden = true, ignored = true },
+        grep = { hidden = true, ignored = true },
       },
     },
   },
