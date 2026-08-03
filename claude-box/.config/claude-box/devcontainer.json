@@ -4,10 +4,9 @@
     "dockerfile": "Dockerfile",
     "args": {
       "TZ": "Europe/Berlin",
-      "CLAUDE_CODE_VERSION": "latest",
-      "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-      "GIT_DELTA_VERSION": "0.18.2",
-      "ZSH_IN_DOCKER_VERSION": "1.2.0"
+      "CLAUDE_CODE_VERSION": "${localEnv:CLAUDE_CODE_VERSION:latest}",
+      "UV_VERSION": "0.12.1",
+      "WITH_RUST": "1"
     }
   },
   "customizations": {
@@ -29,11 +28,11 @@
     "source=claude-code-config-${devcontainerId},target=/home/node/.claude,type=volume"
   ],
   "containerEnv": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "TERM_PROGRAM": "${localEnv:TERM_PROGRAM}",
     "LC_TERMINAL": "${localEnv:LC_TERMINAL}",
     "NODE_OPTIONS": "--max-old-space-size=4096",
-    "CLAUDE_CONFIG_DIR": "/home/node/.claude",
-    "POWERLEVEL9K_DISABLE_GITSTATUS": "true"
+    "CLAUDE_CONFIG_DIR": "/home/node/.claude"
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace"
