@@ -1,4 +1,4 @@
-DC_DEFAULT="$HOME/.confg/claude-box/devcontainer.json"
+DC_DEFAULT="$HOME/.config/claude-box/devcontainer.json"
 
 _dc_config_arg() {
   [ -f .devcontainer/devcontainer.json ] && echo "" || echo "--config $DC_DEFAULT"
