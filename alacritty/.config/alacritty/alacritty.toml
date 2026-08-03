@@ -17,6 +17,7 @@ padding.x = 14
 padding.y = 14
 decorations = "None"
 option_as_alt = "Both"
+opacity = 0.8
 
 [keyboard]
 bindings = [
