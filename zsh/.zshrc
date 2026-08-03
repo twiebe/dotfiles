@@ -1,38 +1,24 @@
-export PATH="${HOME}/bin:${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
+# rcs
+#
+# ~/.zshrc.d and ~/.zshrc.local.d are merged into a single list that is sorted
+# by file name across both directories, so a local file can be placed anywhere
+# in the global order (e.g. ~/.zshrc.local.d/35-foo.zsh runs between the global
+# 30-* and 40-* files). On identical file names the local one is sourced last
+# and therefore wins.
+typeset -a rcs
+typeset rc sep=$'\x1f'
 
-## oh-my-zsh
-export ZSH="$HOME/.oh-my-zsh"
-plugins=(direnv git sudo tmux)
-zstyle ':omz:update' mode disabled
+for rc in ~/.zshrc.d/*(-.N); do
+  rcs+=("${rc:t}${sep}0${sep}${rc}")
+done
+for rc in ~/.zshrc.local.d/*(-.N); do
+  rcs+=("${rc:t}${sep}1${sep}${rc}")
+done
 
-# starship
-if which starship 2>&1 > /dev/null; then
-  eval "$(starship init zsh)"
-  ZSH_THEME=""
-else
-  ZSH_THEME="refined"
-fi
+for rc in ${(o)rcs}; do
+  source "${rc##*${sep}}"
+done
 
-source $ZSH/oh-my-zsh.sh
-
-# opts
-unsetopt share_history
-
-# includes
-if [ -d ~/.zshrc.d ]; then
-  setopt NULL_GLOB
-  for fn in ~/.zshrc.d/*; do
-    source "${fn}"
-  done
-  unsetopt NULL_GLOB
-fi
+unset rcs rc sep
 
 test -f ~/.zshrc.local && source ~/.zshrc.local
-
-if [ -d ~/.zshrc.local.d ]; then
-  setopt NULL_GLOB
-  for fn in ~/.zshrc.local.d/*; do
-    source "${fn}"
-  done
-  unsetopt NULL_GLOB
-fi
