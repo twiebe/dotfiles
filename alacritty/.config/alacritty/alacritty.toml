@@ -19,6 +19,10 @@ decorations = "None"
 option_as_alt = "Both"
 opacity = 0.8
 
+[selection]
+semantic_escape_chars = ",│`|:\"' ()[]{}<>\t@"
+save_to_clipboard = true
+
 [keyboard]
 bindings = [
   { key = "Insert", mods = "Shift", action = "Paste" },
