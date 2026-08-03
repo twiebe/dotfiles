@@ -18,10 +18,29 @@ macos-option-as-alt = true
 window-theme = ghostty
 window-padding-x = 14
 window-padding-y = 14
+# Hide the titlebar but keep native borders, rounded corners and shadow.
+# Costs native tabs: macOS tabbing needs a titlebar, so cmd+t opens a window.
+# Use splits (super+d / super+shift+d) or tmux instead.
+macos-titlebar-style = hidden
+# Alternative: strip borders and rounded corners too, like alacritty's
+# decorations = "None". Swap the comments to compare.
+# window-decoration = none
+# Matches alacritty's window.opacity. NOTE: on macOS a change here needs a full
+# Ghostty restart, cmd+shift+, is not enough. Also disabled in native fullscreen.
+background-opacity = 0.92
+# background-blur = true          # 20 by default, or an integer intensity
+# background-opacity-cells = true # also fade cells with an explicit bg color
 confirm-close-surface=false
 resize-overlay = never
 # Linux/GTK only, ignored on macOS
 gtk-toolbar-style = flat
+
+# Selection
+# Ghostty's default plus @, so double-click splits user@host.
+selection-word-chars = \t'"│`|:;,()[]{} <>$@
+# alacritty's save_to_clipboard: put the selection on the system clipboard,
+# not just the (linux-only) primary selection.
+copy-on-select = clipboard
 
 # Cursor styling
 cursor-style = "block"
@@ -34,6 +53,12 @@ shell-integration-features = no-cursor,ssh-env
 # Keyboard bindings
 keybind = shift+insert=paste_from_clipboard
 keybind = control+insert=copy_to_clipboard
+# These are already the defaults, but binding them explicitly makes cmd+c/cmd+v
+# work in native text fields (search bar, rename tab). Workaround for
+# https://github.com/ghostty-org/ghostty/issues/10749 - needs a full restart,
+# a config reload is not enough. Drop once that issue is fixed.
+keybind = super+v=paste_from_clipboard
+keybind = super+c=copy_to_clipboard
 # Send Shift+Enter as CSI-u so TUIs can distinguish it from Enter.
 keybind = shift+enter=csi:13;2u
 # Legacy encoding sends Alt+Shift+Enter the same as Alt+Enter; send CSI-u so tmux can match M-S-Enter.
