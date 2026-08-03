@@ -37,7 +37,7 @@ gtk-toolbar-style = flat
 
 # Selection
 # Ghostty's default plus @, so double-click splits user@host.
-selection-word-chars = \t'"│`|:;,()[]{} <>$@
+selection-word-chars = \t'"│`|:;,()[]{} <>$@=
 # alacritty's save_to_clipboard: put the selection on the system clipboard,
 # not just the (linux-only) primary selection.
 copy-on-select = clipboard
