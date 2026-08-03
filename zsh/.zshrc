@@ -7,12 +7,13 @@ zstyle ':omz:update' mode disabled
 
 # starship
 if which starship 2>&1 > /dev/null; then
-  source $ZSH/oh-my-zsh.sh
   eval "$(starship init zsh)"
+  ZSH_THEME=""
 else
   ZSH_THEME="refined"
-  source $ZSH/oh-my-zsh.sh
 fi
+
+source $ZSH/oh-my-zsh.sh
 
 # opts
 unsetopt share_history
