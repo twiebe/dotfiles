@@ -9,8 +9,8 @@ hyper - m : open -a Mail
 hyper - n : open -a Affine
 hyper - o : shortcuts run "Switch Audio to Airpods"
 hyper - p : open -a Maps
-hyper - s : open -a Signal
-hyper - t : open -a Ghostty
+hyper - s : open -a Ghostty
+hyper - t : open -a Signal
 hyper - u : open -a Music
 hyper - v : open ~/Downloads
 hyper - w : open -a "Google Chrome"
