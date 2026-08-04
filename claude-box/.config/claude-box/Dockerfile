@@ -8,11 +8,18 @@
 ARG UV_VERSION=0.12.1
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
+# Go is the second exception to the "everything from apt" rule below: trixie
+# ships 1.24 while upstream is at 1.26, and Go's own toolchain policy assumes a
+# current release. Same trick as uv — pull the official image and copy the
+# prebuilt tree out of it, which is why GO_VERSION also has to be global.
+ARG GO_VERSION=1.26.5
+FROM golang:${GO_VERSION}-trixie AS go
+
 # Debian trixie rather than Alpine: projects get built inside this container,
 # and musl costs more there than Alpine's fresher packages gain. Every tool
 # comes from the distro repos — no `wget | sh`, no GitHub release downloads.
-# The only exceptions are claude-code (npm, the whole point of the box) and
-# uv (see above).
+# The only exceptions are claude-code (npm, the whole point of the box) plus uv
+# and Go, both copied out of official images (see above).
 FROM node:26-trixie-slim
 
 # Build-time knobs default here, not in devcontainer.json: this Dockerfile is
@@ -35,7 +42,12 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 # Anything that is per-project or personal taste (starship, direnv, language
 # toolchains beyond the ones below) belongs in a project's own .devcontainer/.
 # trixie versions as of this commit:
-#   git-delta 0.18.2  fzf 0.60.3  gh 2.46.0
+#   git-delta 0.18.2  fzf 0.60.3  gh 2.46.0  python3 3.13
+#
+# python3 is marked externally-managed (PEP 668), so a bare `pip3 install`
+# outside a virtualenv refuses to touch the system site-packages. That is the
+# intended behaviour — use `python3 -m venv` or uv above. python3-pip is here
+# for use *inside* those environments, python3-venv for creating them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
   ca-certificates \
@@ -47,6 +59,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   less \
   pkg-config \
   procps \
+  python3 \
+  python3-pip \
+  python3-venv \
   sudo \
   tmux \
   tzdata \
@@ -56,14 +71,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
-# Rust costs ~1.5 GB, so it is a switch rather than a fixed part of the image.
-# Turn it off for a lean box with --build-arg WITH_RUST=0.
-ARG WITH_RUST=1
-RUN if [ "$WITH_RUST" = "1" ]; then \
-  apt-get update \
+# Rust costs ~1.5 GB. It stays in the image anyway — a box that cannot build
+# the project it is pointed at is not worth the layer it saves.
+RUN apt-get update \
   && apt-get install -y --no-install-recommends rustup clang cbindgen just \
-  && rm -rf /var/lib/apt/lists/*; \
-  fi
+  && rm -rf /var/lib/apt/lists/*
 
 # Replaces zsh-in-docker, which downloaded a script from GitHub that wrote its
 # own ~/.zshrc with powerlevel10k, TERM=xterm and a bash-only PROMPT_COMMAND.
@@ -119,7 +131,14 @@ ENV HISTFILE=/commandhistory/.zsh_history
 ENV CARGO_HOME=/home/node/.cargo
 ENV RUSTUP_HOME=/home/node/.rustup
 ENV PATH=/home/node/.cargo/bin:$PATH
-RUN if [ "$WITH_RUST" = "1" ]; then rustup default stable; fi
+RUN rustup default stable
+
+# ~250 MB, and above claude-code for the same cache reason as Rust.
+#
+# GOPATH stays at its default (/home/node/go); only its bin/ needs to be on PATH
+# so that binaries from `go install` are runnable.
+COPY --from=go /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:/home/node/go/bin:$PATH
 
 # Last layer on purpose — it is the one that changes most often. The shell
 # functions feed a concrete version in via --build-arg, so a new release
