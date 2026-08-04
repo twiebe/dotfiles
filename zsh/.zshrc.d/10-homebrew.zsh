@@ -4,6 +4,6 @@ if [ -x "/opt/homebrew/bin/brew" ]; then
 fi
 
 # user-local installation
-if [ -x "~/.Homebrew/bin/brew" ]; then
-  eval "$(~/.Homebrew/bin/brew shellenv)"
+if [ -x "${HOME}/.Homebrew/bin/brew" ]; then
+  eval "$(${HOME}/.Homebrew/bin/brew shellenv)"
 fi
