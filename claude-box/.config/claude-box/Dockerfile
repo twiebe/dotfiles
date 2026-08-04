@@ -1,18 +1,20 @@
 # syntax=docker/dockerfile:1
 
-# uv is only packaged from Debian forky/sid onwards. Instead of running an
-# installer script, pull it from the official, pinnable image — plain file
-# copying. It needs its own stage because `COPY --from=` does not expand
-# variables, which in turn requires the ARG to live in the global scope,
-# i.e. before the first FROM.
+# uv and Go both come out of their official images rather than an installer
+# script: uv is only packaged from Debian forky/sid onwards, and trixie's Go is
+# 1.24 while upstream is at 1.26 — a gap Go's own toolchain policy does not
+# expect. Each gets a stage of its own because `COPY --from=` does not expand
+# variables.
+#
+# Both version ARGs sit here, before the first FROM, because that is the only
+# place a global ARG exists: the global scope ends at the first FROM, and an ARG
+# after it belongs to that stage alone. Declared further down, GO_VERSION would
+# expand to the empty string and the build would fail with
+# `invalid reference format` on "golang:-trixie".
 ARG UV_VERSION=0.12.1
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
-
-# Go is the second exception to the "everything from apt" rule below: trixie
-# ships 1.24 while upstream is at 1.26, and Go's own toolchain policy assumes a
-# current release. Same trick as uv — pull the official image and copy the
-# prebuilt tree out of it, which is why GO_VERSION also has to be global.
 ARG GO_VERSION=1.26.5
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 FROM golang:${GO_VERSION}-trixie AS go
 
 # Debian trixie rather than Alpine: projects get built inside this container,
