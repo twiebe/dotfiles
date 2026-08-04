@@ -5,7 +5,7 @@
 # copying. It needs its own stage because `COPY --from=` does not expand
 # variables, which in turn requires the ARG to live in the global scope,
 # i.e. before the first FROM.
-ARG UV_VERSION=0.12
+ARG UV_VERSION=0.12.1
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 # Debian trixie rather than Alpine: projects get built inside this container,
@@ -15,7 +15,11 @@ FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 # uv (see above).
 FROM node:26-trixie-slim
 
-ARG TZ
+# Build-time knobs default here, not in devcontainer.json: this Dockerfile is
+# built directly (`docker build`) so that the image gets one fixed name instead
+# of the per-workspace name the devcontainer CLI would pick. `docker build` in
+# this directory therefore has to produce the intended image without arguments.
+ARG TZ=Europe/Berlin
 ENV TZ="$TZ"
 
 # C.UTF-8 works without locale-gen. The previous setup exported
@@ -90,10 +94,12 @@ ARG USERNAME=node
 RUN printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$USERNAME" > /etc/sudoers.d/$USERNAME \
   && chmod 0440 /etc/sudoers.d/$USERNAME
 
-RUN mkdir -p /usr/local/share/npm-global /commandhistory /workspace /home/node/.claude \
-  && chown -R $USERNAME:$USERNAME /usr/local/share/npm-global /commandhistory /workspace /home/node/.claude
+# /workspaces is only the parent — the repo is bind-mounted into
+# /workspaces/<project> at runtime, and Docker creates that subdirectory itself.
+RUN mkdir -p /usr/local/share/npm-global /commandhistory /workspaces /home/node/.claude \
+  && chown -R $USERNAME:$USERNAME /usr/local/share/npm-global /commandhistory /workspaces /home/node/.claude
 
-WORKDIR /workspace
+WORKDIR /workspaces
 USER $USERNAME
 
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
@@ -115,10 +121,9 @@ ENV RUSTUP_HOME=/home/node/.rustup
 ENV PATH=/home/node/.cargo/bin:$PATH
 RUN if [ "$WITH_RUST" = "1" ]; then rustup default stable; fi
 
-# Last layer on purpose — it is the one that changes most often. The default
-# devcontainer.json feeds a concrete version in via
-# ${localEnv:CLAUDE_CODE_VERSION:latest}, so a new release invalidates this
-# layer and nothing above it. That is what lets cbrecreate pick up a new
-# claude-code without --build-no-cache.
+# Last layer on purpose — it is the one that changes most often. The shell
+# functions feed a concrete version in via --build-arg, so a new release
+# invalidates this layer and nothing above it. That is what lets cbrecreate
+# pick up a new claude-code without --no-cache.
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}

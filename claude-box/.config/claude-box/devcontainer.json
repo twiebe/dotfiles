@@ -1,14 +1,13 @@
 {
   "name": "Claude Code",
-  "build": {
-    "dockerfile": "Dockerfile",
-    "args": {
-      "TZ": "Europe/Berlin",
-      "CLAUDE_CODE_VERSION": "${localEnv:CLAUDE_CODE_VERSION:latest}",
-      "UV_VERSION": "0.12.1",
-      "WITH_RUST": "1"
-    }
-  },
+
+  // Prebuilt image instead of a "build" block, so every repo shares one image.
+  // With "build" the devcontainer CLI names the result vsc-<folder>-<hash of
+  // the workspace path>, i.e. one image per repo, and `up` has no way to
+  // override that name. The Dockerfile next to this file produces this tag;
+  // the shell functions build it before calling `up`. Keep the tag in sync
+  // with CB_IMAGE in 90-claude-box.zsh.
+  "image": "claude-box:latest",
   "customizations": {
     "vscode": {
       "extensions": [
@@ -23,9 +22,36 @@
     }
   },
   "remoteUser": "node",
+
+  // Without this Docker hands out a random name (busy_grothendieck), which says
+  // nothing in `docker ps` once several boxes run. The top-level "name" above
+  // is only a display label for editors, so the actual name has to come from a
+  // docker run flag.
+  //
+  // _cb_name() in 90-claude-box.zsh builds cb-<project>-<path hash>; the hash
+  // keeps two checkouts of the same directory name apart. The fallback only
+  // applies to a hand-written `devcontainer up` outside those functions.
+  "runArgs": [
+    "--name", "${localEnv:CB_NAME:claude-box}",
+    "--hostname", "${localEnv:CB_NAME:claude-box}"
+  ],
+  // ~/.claude is ONE volume for every box, so the login (.credentials.json plus
+  // oauthAccount/userID in .claude.json), settings.json and plugins/ are set up
+  // once and then shared.
+  //
+  // Everything project-scoped in there is keyed by the workspace path, not by
+  // the container: projects/<escaped path>/ holds transcripts and memory,
+  // .claude.json has a "projects" section per path (allowedTools, mcpServers,
+  // trust), and history.jsonl tags each prompt with its project. That is why
+  // workspaceFolder below must be unique per repo — with a fixed /workspace
+  // every box would be the same project and would share its permissions,
+  // memory and prompt history.
+  //
+  // Shell history stays per repo; make it "cb-history" without the id for one
+  // shared history across boxes.
   "mounts": [
-    "source=claude-code-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
-    "source=claude-code-config-${devcontainerId},target=/home/node/.claude,type=volume"
+    "source=cb-history-${devcontainerId},target=/commandhistory,type=volume",
+    "source=cb-config,target=/home/node/.claude,type=volume"
   ],
   "containerEnv": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
@@ -34,6 +60,10 @@
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/node/.claude"
   },
-  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
-  "workspaceFolder": "/workspace"
+  // Unique per repo (see the mounts comment). The path deliberately carries no
+  // hash — it shows up in the prompt and in every path Claude prints, so it
+  // stays readable. Two repos whose directory name is identical therefore do
+  // share one project identity; rename one of the directories if that matters.
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localEnv:CB_PROJECT:workspace},type=bind,consistency=delegated",
+  "workspaceFolder": "/workspaces/${localEnv:CB_PROJECT:workspace}"
 }
