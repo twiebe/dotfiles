@@ -1,0 +1,7 @@
+#!/usr/bin/env zsh
+
+for fn in ${HOME}/.local/bin/dotfiles-init-*; do
+  echo "=> ${fn}"
+  "${fn}"
+  echo
+done
