@@ -1,0 +1,5 @@
+#!/usr/bin/env zsh
+
+set -ex
+
+nvim --headless "+Lazy! restore" +qa

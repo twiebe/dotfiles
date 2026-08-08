@@ -1,4 +1,3 @@
-alias dotfiles-nvim-restore='nvim --headless "+Lazy! restore" +qa'
 alias vi='nvim'
 alias vim='nvim'
 export EDITOR='nvim'
