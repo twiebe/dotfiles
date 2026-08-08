@@ -1,0 +1,14 @@
+#!/usr/bin/env zsh
+
+set -e
+
+TARGET_DIR="${HOME}/.config/tmux/plugins/tpm"
+
+if [[ -d "${TARGET_DIR}" ]]; then
+  echo "${TARGET_DIR} already exists. not doing anything."
+  exit 0
+fi
+
+git clone https://github.com/tmux-plugins/tpm ~/.config/tmux/plugins/tpm
+
+echo "done. start or reload tmux config and press <prefix>-I"
