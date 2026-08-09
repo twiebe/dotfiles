@@ -43,7 +43,7 @@ selection-word-chars = \t'"│`|:;,()[]{} <>$@=
 copy-on-select = clipboard
 
 # Cursor styling
-cursor-style = "block"
+cursor-style = "bar"
 cursor-style-blink = false
 
 # Cursor styling + SSH session terminfo
