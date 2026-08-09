@@ -75,3 +75,10 @@ mouse-scroll-multiplier = 0.95
 # Fix general slowness on hyprland (https://github.com/ghostty-org/ghostty/discussions/3224)
 # Linux only, ignored on macOS
 async-backend = epoll
+
+# SHADERS
+# custom-shader = "shaders/animated-gradient-shader.glsl"
+# custom-shader = "shaders/glitchy.glsl"
+# custom-shader = "shaders/glow-rgbsplit-twitchy.glsl"
+# custom-shader = "shaders/gradient-background.glsl"
+# custom-shader = "shaders/sparks-from-fire.glsl"
