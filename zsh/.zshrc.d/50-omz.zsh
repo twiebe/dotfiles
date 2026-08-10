@@ -10,7 +10,7 @@ if [[ ! -v ZSH_THEME ]]; then
 fi
 
 # tmux
-ZSH_TMUX_CONFIG="${XDG_CONFIG_HOME}/tmux/tmux.conf"
+ZSH_TMUX_CONFIG="${HOME}/.config/tmux/tmux.conf"
 
 # plugins
 plugins=(direnv git sudo tmux)

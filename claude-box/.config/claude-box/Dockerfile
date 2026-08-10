@@ -53,6 +53,7 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
   ca-certificates \
+  ffmpeg \
   fzf \
   gh \
   git \
