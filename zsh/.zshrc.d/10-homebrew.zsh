@@ -7,3 +7,11 @@ fi
 if [ -x "${HOME}/.Homebrew/bin/brew" ]; then
   eval "$(${HOME}/.Homebrew/bin/brew shellenv)"
 fi
+
+function ubrew()
+{
+  brew update
+  brew upgrade --greedy
+  brew autoremove
+  brew cleanup --prune=3
+}
