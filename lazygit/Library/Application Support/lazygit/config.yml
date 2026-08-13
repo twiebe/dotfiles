@@ -1,3 +1,9 @@
+git:
+  autoFetch: false
+
+update:
+  method: never
+
 gui:
   theme:
     activeBorderColor:
