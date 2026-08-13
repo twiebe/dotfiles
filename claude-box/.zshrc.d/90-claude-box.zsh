@@ -145,6 +145,86 @@ cbrebuild() {
   fi
 }
 
+# The devcontainer CLI stamps every container it starts with the host folder it
+# was launched from and with the config that produced it, and it finds an
+# existing container again by exactly those labels. Matching on them beats
+# matching on the name: a project with its own .devcontainer/ never reads
+# CB_NAME, so its container ends up with whatever Docker made up.
+#
+# `-a` rather than plain `ps`, so an already stopped container is found too.
+_cb_names() {
+  docker ps -a --format '{{.Names}}' "$@"
+}
+
+# Same set, as a table. The folder column is what actually identifies a box; the
+# name only carries the project slug and a hash.
+_cb_table() {
+  docker ps -a "$@" \
+    --format 'table {{.Names}}\t{{.Status}}\t{{.Label "devcontainer.local_folder"}}'
+}
+
+# Remove whatever the filter matches, and report it by name.
+#
+# No -v anywhere in this file: the volumes are the entire reason coming back is
+# cheap — cb-config holds the login and the Claude config, cb-history-<id> the
+# shell history — so a teardown must never take them along. Only container
+# state is lost.
+_cb_rm() {
+  local -a names
+  names=(${(f)"$(_cb_names "$@")"})
+  names=(${names:#})
+  (( $#names )) || return 1
+  docker rm -f $names >/dev/null || return
+  print "removed: ${(j: :)names}"
+}
+
+# Throw the box for this directory away. The counterpart to cbup: cbrecreate is
+# "start over right now", this one is "I am done here".
+#
+# --all covers every box running off the global config. A project with its own
+# .devcontainer/ carries a different config_file label and is by then
+# indistinguishable from any other devcontainer, so that one is dcdown's job —
+# plain cbdown still gets it, being keyed on the folder.
+cbdown() {
+  if [[ "$1" == (-a|--all) ]]; then
+    _cb_rm --filter "label=devcontainer.config_file=$CB_CONFIG" && return
+    print -u2 "no claude box found"
+    return 1
+  fi
+  _cb_rm --filter "label=devcontainer.local_folder=$PWD" && return
+  print -u2 "no claude box for $PWD"
+  return 1
+}
+
+cbls() {
+  _cb_table --filter "label=devcontainer.config_file=$CB_CONFIG"
+}
+
+# Every devcontainer on the machine, whatever started it. The label is queried
+# for existence only, so VS Code's containers and other projects' `devcontainer
+# up` are in scope as well — hence the listing and the prompt before anything
+# happens. -y skips the prompt for scripted use.
+dcdown() {
+  local -a names
+  names=(${(f)"$(_cb_names --filter "label=devcontainer.local_folder")"})
+  names=(${names:#})
+  (( $#names )) || { print -u2 "no devcontainer found"; return 1 }
+
+  if [[ "$1" != (-y|--yes) ]]; then
+    dcls
+    print
+    read -q "?remove $#names devcontainer(s)? [y/N] " || { print; return 1 }
+    print
+  fi
+
+  docker rm -f $names >/dev/null || return
+  print "removed: ${(j: :)names}"
+}
+
+dcls() {
+  _cb_table --filter "label=devcontainer.local_folder"
+}
+
 claude-box() {
   cbup >/dev/null && cbexec claude "$@"
 }
