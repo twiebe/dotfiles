@@ -57,6 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   fzf \
   gh \
   git \
+  git-lfs \
   git-delta \
   jq \
   less \
