@@ -78,6 +78,13 @@ format = '[[ $symbol $branch ](fg:crust bg:yellow)]($style)'
 [git_status]
 style = "bg:yellow"
 format = '[[($all_status$ahead_behind )](fg:crust bg:yellow)]($style)'
+# Without this, `git status` recurses into every submodule worktree on every
+# prompt. In a superproject whose submodule carries a large generated tree the
+# scan takes over a second, which blows past starship's 500ms command_timeout —
+# the module then renders nothing at all, so the wait buys no information.
+# Moving the submodule pointer is still reported; only changes inside the
+# submodule worktree are ignored.
+ignore_submodules = true
 
 [nodejs]
 symbol = ""
