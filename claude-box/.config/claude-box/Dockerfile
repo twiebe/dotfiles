@@ -61,6 +61,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   git-delta \
   jq \
   less \
+  lua5.4 \
   pkg-config \
   procps \
   python3 \
