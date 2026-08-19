@@ -1,5 +1,13 @@
 "$schema" = 'https://starship.rs/config-schema.json'
 
+# git_status only shells out to the git binary when core.fsmonitor is true (or
+# the repo uses reftables or a sparse index); otherwise it runs in-process via
+# gitoxide. Only that executable path is bound by command_timeout, so enabling
+# fsmonitor is what first made the 500ms default bite: a cold daemon plus the
+# untracked scan does not fit, the module renders nothing and starship logs a
+# warning on every prompt draw.
+command_timeout = 2000
+
 format = """
 [](red)\
 $os\
@@ -80,8 +88,8 @@ style = "bg:yellow"
 format = '[[($all_status$ahead_behind )](fg:crust bg:yellow)]($style)'
 # Without this, `git status` recurses into every submodule worktree on every
 # prompt. In a superproject whose submodule carries a large generated tree the
-# scan takes over a second, which blows past starship's 500ms command_timeout —
-# the module then renders nothing at all, so the wait buys no information.
+# scan takes over a second, which blows past command_timeout — the module then
+# renders nothing at all, so the wait buys no information.
 # Moving the submodule pointer is still reported; only changes inside the
 # submodule worktree are ignored.
 ignore_submodules = true
