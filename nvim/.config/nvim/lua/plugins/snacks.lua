@@ -1,6 +1,9 @@
 return {
   "folke/snacks.nvim",
   opts = {
+    -- Smooth scrolling only. Other snacks animations (indent guides, dim,
+    -- notifier) keep animating.
+    scroll = { enabled = false },
     picker = {
       sources = {
         explorer = { hidden = true, ignored = true },
