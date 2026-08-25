@@ -22,3 +22,7 @@ done
 unset rcs rc sep
 
 test -f ~/.zshrc.local && source ~/.zshrc.local
+
+if which fastfetch 2>&1 >/dev/null; then
+  fastfetch -c archey.jsonc
+fi
