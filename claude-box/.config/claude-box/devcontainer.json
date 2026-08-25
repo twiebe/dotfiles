@@ -31,9 +31,18 @@
   // _cb_name() in 90-claude-box.zsh builds cb-<project>-<path hash>; the hash
   // keeps two checkouts of the same directory name apart. The fallback only
   // applies to a hand-written `devcontainer up` outside those functions.
+  //
+  // --privileged is what lets dockerd inside the box mount, write cgroups and
+  // program iptables. Spelled with an explicit value rather than as a bare
+  // flag so that only a box started via cbdind gets those rights and every
+  // other one stays unprivileged.
+  //
+  // runArgs are only read when the container is created, so switching this
+  // replaces the container instead of restarting it.
   "runArgs": [
     "--name", "${localEnv:CB_NAME:claude-box}",
-    "--hostname", "${localEnv:CB_NAME:claude-box}"
+    "--hostname", "${localEnv:CB_NAME:claude-box}",
+    "--privileged=${localEnv:CB_DIND:false}"
   ],
   // ~/.claude is ONE volume for every box, so the login (.credentials.json plus
   // oauthAccount/userID in .claude.json), settings.json and plugins/ are set up
@@ -58,8 +67,16 @@
     "TERM_PROGRAM": "${localEnv:TERM_PROGRAM}",
     "LC_TERMINAL": "${localEnv:LC_TERMINAL}",
     "NODE_OPTIONS": "--max-old-space-size=4096",
-    "CLAUDE_CONFIG_DIR": "/home/node/.claude"
+    "CLAUDE_CONFIG_DIR": "/home/node/.claude",
+    // Read by cb-dockerd to decide whether to start a daemon. Captured at
+    // creation time on purpose: the container keeps the answer, so a later
+    // plain `cb` brings the box back up with its daemon and does not have to
+    // repeat the flag.
+    "CB_DIND": "${localEnv:CB_DIND:false}"
   },
+  // Runs on every start of the container, as node. A no-op unless CB_DIND is
+  // true, so the boxes without Docker pay a process spawn and nothing else.
+  "postStartCommand": "sudo /usr/local/bin/cb-dockerd",
   // Unique per repo (see the mounts comment). The path deliberately carries no
   // hash — it shows up in the prompt and in every path Claude prints, so it
   // stays readable. Two repos whose directory name is identical therefore do

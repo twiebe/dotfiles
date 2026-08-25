@@ -49,6 +49,7 @@ _cb_dc() {
   shift
   local -x CB_PROJECT="$(_cb_project)"
   local -x CB_NAME="cb-$CB_PROJECT-$(_cb_path_hash)"
+  local -x CB_DIND="${CB_DIND:-false}"
   if _cb_local_config; then
     devcontainer "$cmd" --workspace-folder "$PWD" "$@"
   else
@@ -114,6 +115,21 @@ cbexec() {
 # left exactly as it is; use cbupdate or cbrebuild to touch that.
 cbrecreate() {
   _cb_ensure_image && _cb_dc up --remove-existing-container
+}
+
+# A box with its own Docker daemon: containers built inside it see the same
+# paths the box does, so a bind mount of the workspace resolves. Costs
+# --privileged, which is why it is not the default.
+#
+# Replaces the container rather than restarting it, because --privileged is a
+# creation-time flag. The volumes are untouched as always; whatever the old box
+# had in /workspaces beyond the bind mount is gone.
+#
+# Only needed once per box: CB_DIND ends up in the container's environment, so a
+# later `cb` starts the daemon again. `cbrecreate` without it, on the other
+# hand, gives back an ordinary box.
+cbdind() {
+  CB_DIND=true cbrecreate
 }
 
 # Pull in a new claude-code release, then recreate the container so it actually
