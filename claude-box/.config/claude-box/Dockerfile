@@ -82,6 +82,24 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends rustup clang cbindgen just \
   && rm -rf /var/lib/apt/lists/*
 
+# Docker-in-Docker, used by boxes started with CB_DIND=true. Only the binaries
+# live here; the daemon is started per container by cb-dockerd, because the
+# image has no init to run the systemd unit this package ships and because
+# nothing of /var/lib/docker may end up in a layer.
+#
+# docker-cli is a Recommends of docker.io and would be dropped by
+# --no-install-recommends; containerd, runc and iptables are hard dependencies
+# and come along on their own. fuse-overlayfs is the storage driver for the
+# normal case — see cb-dockerd for why overlay2 is not.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    docker.io \
+    docker-cli \
+    fuse-overlayfs \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=0755 cb-dockerd /usr/local/bin/cb-dockerd
+
 # Replaces zsh-in-docker, which downloaded a script from GitHub that wrote its
 # own ~/.zshrc with powerlevel10k, TERM=xterm and a bash-only PROMPT_COMMAND.
 # This is a small global config built from what apt installed anyway.
@@ -108,8 +126,17 @@ ARG USERNAME=node
 
 # sudo used to be a no-op: no sudoers entry, and node has no password.
 # Either do it properly or leave the package out.
-RUN printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$USERNAME" > /etc/sudoers.d/$USERNAME \
+#
+# The env_keep line exists for cb-dockerd: postStartCommand reaches it through
+# sudo, and sudo drops the environment it would otherwise read CB_DIND from.
+RUN printf 'Defaults env_keep += "CB_DIND"\n%s ALL=(ALL) NOPASSWD:ALL\n' "$USERNAME" > /etc/sudoers.d/$USERNAME \
   && chmod 0440 /etc/sudoers.d/$USERNAME
+
+# dockerd creates its socket as root:docker with mode 0660, so this membership
+# is all that stands between node and "permission denied while trying to connect
+# to the Docker daemon socket". groupadd -f because the docker.io package has
+# usually created the group already.
+RUN groupadd -f docker && usermod -aG docker "$USERNAME"
 
 # /workspaces is only the parent — the repo is bind-mounted into
 # /workspaces/<project> at runtime, and Docker creates that subdirectory itself.

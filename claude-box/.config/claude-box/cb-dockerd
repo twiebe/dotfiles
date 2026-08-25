@@ -1,0 +1,91 @@
+#!/bin/sh
+# Starts a Docker daemon inside a claude box. Run as root by the
+# postStartCommand in devcontainer.json, on every start of the container.
+#
+# The daemon runs in the box instead of the box talking to the host daemon
+# through a mounted socket: with a mounted socket every path in `docker run -v`
+# is resolved on the host, where /workspaces/<project> does not exist, and every
+# box would hold root on the host.
+set -eu
+
+LOG=/var/log/cb-dockerd.log
+SOCKET_TIMEOUT=30
+
+# Only a box started with CB_DIND=true is privileged, and without those
+# capabilities dockerd cannot mount, write cgroups or program iptables — it
+# would just leave an error in the log of every other box. devcontainer.json
+# feeds this value into containerEnv as well as into --privileged, so the
+# container keeps its answer for later starts, whatever the restarting shell
+# has set. sudo passes it through via an env_keep line in /etc/sudoers.d.
+[ "${CB_DIND:-false}" = true ] || exit 0
+
+# `devcontainer up` against an already running box runs postStartCommand again.
+# A daemon serving the current session has to survive that, so this returns
+# before the wipe below ever happens.
+if pgrep -x dockerd >/dev/null 2>&1; then
+  exit 0
+fi
+
+# /var/lib/docker deliberately has no volume: images and containers built inside
+# a box are scratch space. It lives on the container's writable layer, which
+# cbrecreate throws away; the wipe here covers the other case, a plain restart
+# of the same container.
+#
+# Mounts below it only exist when a previous dockerd was killed without cleaning
+# up within this container's lifetime. rm would fail on those with "device or
+# resource busy".
+reset_state() {
+  grep ' /var/lib/docker' /proc/mounts | cut -d' ' -f2 | sort -r |
+    while read -r mountpoint; do
+      umount -l "$mountpoint" 2>/dev/null || true
+    done
+  rm -rf /var/lib/docker
+  mkdir -p /var/lib/docker
+}
+
+# The outer daemon hands out 172.17.0.0/16 as well, and a box whose networks
+# overlap the host's loses the traffic between the two.
+#
+# setsid detaches dockerd from the exec session that postStartCommand runs in;
+# that session ends the moment this script returns.
+start_dockerd() {
+  reset_state
+  setsid dockerd \
+    --storage-driver "$1" \
+    --default-address-pool base=10.201.0.0/16,size=24 \
+    >>"$LOG" 2>&1 </dev/null &
+
+  # Returning before the socket answers would race the first docker command in
+  # the box, which follows right after this.
+  waited=0
+  while [ "$waited" -lt "$SOCKET_TIMEOUT" ]; do
+    docker version >/dev/null 2>&1 && return 0
+    pgrep -x dockerd >/dev/null 2>&1 || return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# overlay2 refuses to run on top of another overlayfs, and the container's
+# writable layer is exactly that. fuse-overlayfs does the same job from user
+# space, which is why a dind box needs /dev/fuse. Anything else — a volume, a
+# vfs-backed layer — gets the faster native driver.
+mkdir -p /var/lib/docker
+case "$(stat -f -c %T /var/lib/docker)" in
+  overlayfs) driver=fuse-overlayfs ;;
+  *) driver=overlay2 ;;
+esac
+
+start_dockerd "$driver" && exit 0
+
+# vfs copies whole layers instead of stacking them and asks nothing of the
+# kernel, so it works where the others do not. Slow and disk hungry, hence only
+# after the real driver has failed.
+echo "cb-dockerd: $driver failed, falling back to vfs" >&2
+tail -n 20 "$LOG" >&2
+start_dockerd vfs && exit 0
+
+echo "cb-dockerd: dockerd did not start, see $LOG" >&2
+tail -n 20 "$LOG" >&2
+exit 1
