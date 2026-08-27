@@ -24,7 +24,7 @@ if [[ -z "$ZSH_THEME" ]]; then
 fi
 
 # plugins
-plugins=(direnv git sudo tmux)
+plugins=(direnv fzf git sudo tmux)
 
 source $ZSH/oh-my-zsh.sh
 
