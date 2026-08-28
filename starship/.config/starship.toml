@@ -84,6 +84,9 @@ style = "bg:yellow"
 format = '[[ $symbol $branch ](fg:crust bg:yellow)]($style)'
 
 [git_status]
+# Disabled: the status scan (untracked files, ahead/behind) is what makes the
+# prompt slow in large repos; the branch name alone is cheap and enough.
+disabled = true
 style = "bg:yellow"
 format = '[[($all_status$ahead_behind )](fg:crust bg:yellow)]($style)'
 # Without this, `git status` recurses into every submodule worktree on every
