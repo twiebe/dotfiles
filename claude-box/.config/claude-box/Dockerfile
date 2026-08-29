@@ -109,10 +109,23 @@ RUN apt-get update \
 # --no-install-recommends; containerd, runc and iptables are hard dependencies
 # and come along on their own. fuse-overlayfs is the storage driver for the
 # normal case — see cb-dockerd for why overlay2 is not.
+#
+# docker-compose is trixie's 2.26.1, i.e. Compose v2. It installs the CLI
+# plugin at /usr/libexec/docker/cli-plugins/docker-compose and symlinks
+# /usr/bin/docker-compose to it, so `docker compose up` and the older
+# `docker-compose up` are the same binary. Without it `docker compose` exits
+# with "'compose' is not a docker command", which is what any project driving
+# its dev stack from a compose file hits first.
+#
+# It comes from trixie main like everything else here; Docker's own apt repo is
+# not needed and would break the no-third-party-repo rule at the top of this
+# file. Note the name: docker-compose-v2 is a Ubuntu package and does not exist
+# in Debian.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     docker.io \
     docker-cli \
+    docker-compose \
     fuse-overlayfs \
   && rm -rf /var/lib/apt/lists/*
 
