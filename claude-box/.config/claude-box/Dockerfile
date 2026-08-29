@@ -45,14 +45,31 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 # toolchains beyond the ones below) belongs in a project's own .devcontainer/.
 # trixie versions as of this commit:
 #   git-delta 0.18.2  fzf 0.60.3  gh 2.46.0  python3 3.13
+#   cmake 3.31.6  curl 8.14.1  sqlite3 3.46.1
 #
 # python3 is marked externally-managed (PEP 668), so a bare `pip3 install`
 # outside a virtualenv refuses to touch the system site-packages. That is the
 # intended behaviour — use `python3 -m venv` or uv above. python3-pip is here
 # for use *inside* those environments, python3-venv for creating them.
+#
+# Every entry below names the command that breaks without it. The three added
+# most recently:
+#   cmake    `cargo build` in any crate with a CMake-driven -sys dependency.
+#            Not a niche case: audiopus_sys, aws-lc-sys and friends all shell
+#            out to it from build.rs and fail with "is `cmake` not installed?"
+#            before a single line of the crate itself compiles. The box already
+#            ships build-essential, pkg-config, clang and cbindgen — cmake was
+#            the one hole left in that set.
+#   curl     Anything probing a local endpoint: `curl localhost:3000/health`
+#            during a manual smoke test, and most upstream install snippets.
+#            Missing entirely, not merely unlinked.
+#   sqlite3  `sqlite3 <db> '<query>'` — checking SQL semantics by hand against
+#            a dev database, which the app's own binary cannot answer.
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
   ca-certificates \
+  cmake \
+  curl \
   ffmpeg \
   fzf \
   gh \
@@ -67,6 +84,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   python3 \
   python3-pip \
   python3-venv \
+  sqlite3 \
   sudo \
   tmux \
   tzdata \
@@ -171,6 +189,80 @@ RUN rustup default stable
 # so that binaries from `go install` are runnable.
 COPY --from=go /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:/home/node/go/bin:$PATH
+
+# sqlx-cli, for projects whose schema is managed by SQLx. Without it
+# `sqlx database reset`, `sqlx migrate run` and `cargo sqlx prepare` — the
+# commands behind the usual `make reset-db` and `make prepare` targets — cannot
+# run at all.
+#
+# rustls rather than the default native-tls, which is what keeps libssl-dev out
+# of the image; the rest of the default feature set is unchanged. `sqlite` is
+# the bundled build, so it compiles libsqlite3 itself with the C toolchain from
+# build-essential.
+#
+# --locked builds against the crate's own Cargo.lock, so the pin below fixes the
+# whole dependency tree and not just the top-level version. 0.9.0 wants
+# rustc >= 1.94, which `rustup default stable` above satisfies.
+#
+# The registry cache is dropped afterwards: it is ~300 MB of index and .crate
+# files that go stale long before the image is rebuilt, and cargo refetches what
+# a project actually needs.
+#
+# Above claude-code for the usual cache reason — this is a from-source build of
+# several minutes and must not be redone for a claude-code release.
+ARG SQLX_VERSION=0.9.0
+RUN cargo install sqlx-cli@${SQLX_VERSION} --locked \
+      --no-default-features \
+      --features rustls,postgres,mysql,sqlite,completions,sqlx-toml \
+  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
+
+# Cargo's target directory, moved off the bind mount.
+#
+# /workspaces/<project> is a bind mount of the host checkout, which on macOS is
+# virtiofs. Building there is slow and, worse, corrupts .rlibs. An ENV rather
+# than a line in /etc/zsh/zshrc so it reaches every process — a non-interactive
+# `cbexec cargo test`, a build an editor spawns, a hook — and not only
+# interactive shells.
+#
+# One directory per box rather than per project, which is what a box already is:
+# workspaceFolder in devcontainer.json is unique per repo, so a box holds one
+# checkout. Not a volume, deliberately: this is rebuildable state, and
+# cbrecreate is supposed to hand back a clean slate.
+#
+# Must stay BELOW the `cargo install` above, otherwise that build's
+# intermediates land here and ship inside the image.
+ENV CARGO_TARGET_DIR=/home/node/.cache/cargo-target
+
+# Playwright's Chromium plus the shared libraries it dlopen()s at startup.
+# Without the libraries `npx playwright install chromium` refuses to run at all,
+# failing inside _validateHostRequirements; without the browser every Playwright
+# test aborts with "Executable doesn't exist at .../chrome-linux/headless_shell".
+# The two steps together cost several minutes on a cold cache, which is the
+# whole reason to bake them in.
+#
+# install-deps is the only half that needs root, since it apt-installs. The
+# download runs as node so the browser lands in /home/node/.cache/ms-playwright,
+# an ordinary image layer — none of the volumes in devcontainer.json cover
+# ~/.cache. Order matters: the host-requirements check runs first.
+#
+# The `apt-get update` is not redundant. install-deps shells out to `apt-get
+# install` without refreshing first, and every apt block above ends by wiping
+# /var/lib/apt/lists — so without this the build dies on "Unable to locate
+# package libnss3" for two dozen packages that trixie does in fact carry.
+#
+# check-images: hold - this pin deliberately does not track any project's
+# lockfile. A project pins @playwright/test in its own package-lock.json and
+# this image is shared by all of them, so the two are independent by
+# construction. The baked browser is a warm cache, not a contract: a project on
+# another version runs `npx playwright install chromium` and gets its own
+# revision beside this one, because the cache directory is node-owned. Bump this
+# on its own schedule.
+ARG PLAYWRIGHT_VERSION=1.62.1
+RUN sudo apt-get update \
+  && sudo npx --yes @playwright/test@${PLAYWRIGHT_VERSION} install-deps chromium \
+  && npx --yes @playwright/test@${PLAYWRIGHT_VERSION} install chromium \
+  && sudo rm -rf /var/lib/apt/lists/* /root/.npm \
+  && rm -rf /home/node/.npm/_npx
 
 # Last layer on purpose — it is the one that changes most often. The shell
 # functions feed a concrete version in via --build-arg, so a new release

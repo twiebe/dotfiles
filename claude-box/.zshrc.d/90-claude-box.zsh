@@ -149,7 +149,8 @@ cbupdate() {
 
 # Nuclear option: discard every cached layer, Rust toolchain included, then
 # recreate the container. Reach for cbupdate first — it gets you a current
-# claude-code without the ~1.5 GB Rust download.
+# claude-code without the ~1.5 GB Rust download, the from-source sqlx-cli build
+# and the Playwright browser download.
 #
 # The two branches differ because a project-local .devcontainer/ is built by the
 # CLI, which spells the flag --build-no-cache.
