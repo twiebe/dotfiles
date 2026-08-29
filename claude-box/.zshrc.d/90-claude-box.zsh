@@ -102,7 +102,40 @@ _cb_ensure_image() {
   docker image inspect "$CB_IMAGE" >/dev/null 2>&1 || _cb_build "$@"
 }
 
+# --dind asks for a box with its own Docker daemon: containers built inside it
+# see the same paths the box does, so a bind mount of the workspace resolves.
+# Costs --privileged, which is why it is not the default.
+#
+# Offered by every command that replaces the container, and by no other, because
+# --privileged is a creation-time flag: cbup would accept it and then silently
+# do nothing whenever a container is already there.
+#
+# Only needed once per box. CB_DIND ends up in the container's environment, so a
+# later plain `cb` brings the daemon back up; recreating without the flag, on the
+# other hand, gives back an ordinary box.
+#
+# The answer travels as CB_DIND, which _cb_dc exports and devcontainer.json turns
+# into --privileged. Assigns into the caller's `local CB_DIND` via zsh's dynamic
+# scoping; `CB_DIND=true cbrecreate` still works and is what the flag expands to.
+# An unknown argument is rejected rather than ignored, so a typo cannot quietly
+# hand back an unprivileged box.
+_cb_dind() {
+  case "${1:-}" in
+    --dind) CB_DIND=true ;;
+    "") ;;
+    *) print -u2 "unknown option: $1"; return 1 ;;
+  esac
+}
+
+# Starts the box, creating it only if it is not there yet. Deliberately does not
+# take --dind: it would be a no-op against a container that already exists, and
+# a silently unprivileged box is the failure this whole flag exists to avoid.
 cbup() {
+  if [[ "${1:-}" == --dind ]]; then
+    print -u2 "cbup does not take --dind — --privileged applies at creation time only."
+    print -u2 "use: cbrecreate --dind"
+    return 1
+  fi
   _cb_ensure_image && _cb_dc up
 }
 
@@ -113,23 +146,13 @@ cbexec() {
 # Container only: throw it away and start a fresh one from the image that is
 # already there — for picking up changed mounts, env or volumes. The image is
 # left exactly as it is; use cbupdate or cbrebuild to touch that.
+#
+# The volumes are untouched as always; whatever the old box had in /workspaces
+# beyond the bind mount is gone. Takes --dind (see _cb_dind).
 cbrecreate() {
+  local CB_DIND="${CB_DIND:-false}"
+  _cb_dind "$@" || return
   _cb_ensure_image && _cb_dc up --remove-existing-container
-}
-
-# A box with its own Docker daemon: containers built inside it see the same
-# paths the box does, so a bind mount of the workspace resolves. Costs
-# --privileged, which is why it is not the default.
-#
-# Replaces the container rather than restarting it, because --privileged is a
-# creation-time flag. The volumes are untouched as always; whatever the old box
-# had in /workspaces beyond the bind mount is gone.
-#
-# Only needed once per box: CB_DIND ends up in the container's environment, so a
-# later `cb` starts the daemon again. `cbrecreate` without it, on the other
-# hand, gives back an ordinary box.
-cbdind() {
-  CB_DIND=true cbrecreate
 }
 
 # Pull in a new claude-code release, then recreate the container so it actually
@@ -142,7 +165,11 @@ cbdind() {
 #
 # For a project-local .devcontainer/ there is nothing to resolve here; the CLI
 # builds that image itself, from its own Dockerfile.
+#
+# Takes --dind (see _cb_dind).
 cbupdate() {
+  local CB_DIND="${CB_DIND:-false}"
+  _cb_dind "$@" || return
   _cb_local_config || _cb_build || return
   _cb_dc up --remove-existing-container
 }
@@ -154,7 +181,11 @@ cbupdate() {
 #
 # The two branches differ because a project-local .devcontainer/ is built by the
 # CLI, which spells the flag --build-no-cache.
+#
+# Takes --dind (see _cb_dind).
 cbrebuild() {
+  local CB_DIND="${CB_DIND:-false}"
+  _cb_dind "$@" || return
   if _cb_local_config; then
     _cb_dc up --remove-existing-container --build-no-cache
   else

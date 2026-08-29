@@ -34,7 +34,7 @@
   //
   // --privileged is what lets dockerd inside the box mount, write cgroups and
   // program iptables. Spelled with an explicit value rather than as a bare
-  // flag so that only a box started via cbdind gets those rights and every
+  // flag so that only a box created with --dind gets those rights and every
   // other one stays unprivileged.
   //
   // runArgs are only read when the container is created, so switching this
