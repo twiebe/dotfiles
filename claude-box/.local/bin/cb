@@ -823,9 +823,18 @@ def cmd_update_claude(flags, args):
     Cheap on purpose: claude-code is the last layer in the Dockerfile, so a bump
     invalidates nothing above it. With the version unchanged every layer is a
     cache hit and this is `recreate` with a registry lookup in front.
+
+    Recreates the box here because running the new binary is the point, but only
+    one that already exists: building an image is no reason to create a box in
+    whatever directory the command was typed in.
     """
     reject_extra("update-claude", args)
     build_image(resolve_features(read_json(image_state_path()), {}))
+
+    if box_for(current_workspace()) is None:
+        if not DRY_RUN:
+            print("\nbuilt {}. no box here to recreate.".format(CB_IMAGE))
+        return 0
     return cmd_recreate(flags, [])
 
 
@@ -836,6 +845,12 @@ def cmd_rebuild_image(flags, args):
     the same set. --no-cache is the nuclear option: it discards the Rust
     toolchain, the from-source sqlx-cli build and the Playwright download, which
     update-claude gets you without.
+
+    Builds and stops. The image is shared by every box, so touching only the one
+    in the current directory would be an arbitrary half-measure — and running
+    this from a directory that has no box would create one as a side effect of
+    a build. Containers keep the image they were created from until they are
+    replaced, hence the closing line.
     """
     overrides, args = extract_feature_flags(args)
     no_cache = "--no-cache" in args
@@ -845,10 +860,9 @@ def cmd_rebuild_image(flags, args):
     write_json(image_state_path(), features)
     build_image(features, no_cache=no_cache)
 
-    workspace = current_workspace()
-    if box_for(workspace) is not None:
-        settings, _ = box_settings(workspace, flags)
-        dc_up(workspace, settings["docker"][0], recreate=True)
+    if not DRY_RUN:
+        print("\nbuilt {}. existing boxes keep the old image until "
+              "`cb recreate`.".format(CB_IMAGE))
     return 0
 
 
