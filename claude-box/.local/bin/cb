@@ -1,0 +1,1052 @@
+#!/usr/bin/env python3
+"""claude-box: a disposable container per checkout, with Claude Code in it."""
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import urllib.request
+
+CB_DIR = os.path.expanduser("~/.config/claude-box")
+CB_CONFIG = os.path.join(CB_DIR, "devcontainer.json")
+
+# Must match the "image" field in CB_CONFIG. One tag for every box: the
+# Dockerfile is built here rather than by the devcontainer CLI, which would
+# derive a vsc-<folder>-<hash> name and give each repo an image of its own.
+CB_IMAGE = "claude-box:latest"
+
+CLAUDE_PACKAGE = "@anthropic-ai/claude-code"
+
+# Set by --dry-run. Every command that would change something goes through
+# run(), so one flag covers all of them.
+DRY_RUN = False
+
+
+class CbError(Exception):
+    """Anything cb reports as one line rather than as a traceback."""
+
+    code = 1
+
+
+class UsageError(CbError):
+    """A mistake on the command line."""
+
+    code = 2
+
+
+class MissingBinary(CbError):
+    """docker or devcontainer is not on PATH."""
+
+    code = 127
+
+    def __init__(self, name):
+        super().__init__("{} not found on PATH".format(name))
+
+
+# ---------------------------------------------------------------------------
+# Identity
+#
+# A box is identified by the directory it was launched from. Two names are
+# derived from that path: a slug, which is readable and appears in the
+# workspace path inside the box, and a hash, which makes the pair unique.
+# ---------------------------------------------------------------------------
+
+NAME_PREFIX = "cb"
+
+
+def slug(basename):
+    """Readable half of a box's identity, derived from a directory name.
+
+    Used for both the container name and the workspace path inside the box, so
+    only [a-z0-9-] survives: underscores and dots are fine for a container name
+    but not for a hostname, and --hostname gets the same value.
+
+    Runs of dashes collapse and the edges are trimmed, otherwise a dotted
+    directory name reads badly — ~/.dotfiles would become cb--dotfiles and
+    /workspaces/-dotfiles. A name made up entirely of discarded characters
+    falls back to "box".
+    """
+    cleaned = re.sub(r"[^a-zA-Z0-9-]", "-", basename)
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+    return (cleaned or "box").lower()
+
+
+def path_hash(path):
+    """Unique half of a box's identity: a short digest of the absolute path.
+
+    Tells two checkouts with the same directory name apart. The zsh version
+    took the first 8 characters of sha256 over $PWD; keeping that exact
+    definition means cb finds the containers it created.
+    """
+    return hashlib.sha256(path.encode()).hexdigest()[:8]
+
+
+def container_name(path):
+    return "{}-{}-{}".format(NAME_PREFIX, slug(os.path.basename(path)), path_hash(path))
+
+
+# ---------------------------------------------------------------------------
+# Settings
+#
+# One file per box, remembering the answers that would otherwise have to be
+# repeated on every invocation. Flag beats file beats default, and the flag
+# that wins is also written back, so `cb --docker` once is permanent.
+#
+# The store lives under XDG_STATE_HOME and not next to devcontainer.json,
+# because that directory is stowed: stow folds a directory it alone owns into a
+# single symlink, so writing there would write into the dotfiles checkout.
+# ---------------------------------------------------------------------------
+
+SETTINGS_VERSION = 1
+
+# Key to default. Also the whitelist: anything else in the file is ignored, so
+# a leftover from an older version cannot change how a box starts.
+SETTINGS_DEFAULTS = {
+    "docker": False,
+    "force": False,
+}
+
+
+def read_json(path):
+    """Parsed contents of `path`, or {} if there are none to be had.
+
+    A missing file is the normal case for something never configured.
+    Unparseable JSON is treated the same way rather than as an error: the
+    defaults are the safe ones, and a stray comma in a hand-edited file must not
+    stop a box from starting.
+    """
+    try:
+        with open(path) as handle:
+            parsed = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def write_json(path, data):
+    """Write `data` to `path`, unless this is a dry run.
+
+    The check belongs here rather than at each call site: --dry-run promises to
+    change nothing, and remembering --docker while printing the command it did
+    not run would break that quietly.
+    """
+    if DRY_RUN:
+        print("+ write " + str(path))
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "claude-box")
+
+
+def settings_path(path):
+    """Where the settings for the box in `path` live.
+
+    Named after the container, so `ls` on the store and `docker ps` line up.
+    """
+    return os.path.join(state_dir(), "projects", container_name(path) + ".json")
+
+
+def load_settings(path):
+    """Stored settings, or {} if there are none to be had.
+
+    A missing file is the normal case for a box that has never been configured.
+    Unparseable JSON is treated the same way rather than as an error: the
+    defaults are the safe ones, and a stray comma in a hand-edited file must not
+    stop a box from starting.
+    """
+    return read_json(path)
+
+
+def save_settings(path, overrides, workspace):
+    """Merge `overrides` into the stored settings and write them back.
+
+    A None override means the flag was not given and leaves the stored value
+    alone — --docker and --no-docker share one destination, so absent has to be
+    distinguishable from False.
+
+    `workspace` is recorded so `cb config --prune` can tell which entries belong
+    to directories that no longer exist.
+    """
+    stored = load_settings(path)
+    stored["version"] = SETTINGS_VERSION
+    stored["path"] = workspace
+    for key, value in overrides.items():
+        if value is not None:
+            stored[key] = value
+
+    write_json(path, stored)
+    return stored
+
+
+def resolve_settings(stored, overrides):
+    """Effective settings as {key: (value, source)}.
+
+    The source is what `cb config` prints, and the reason this returns pairs
+    rather than plain values: "docker true" is not actionable, "docker true
+    (flag)" tells you the file still says something else.
+    """
+    resolved = {}
+    for key, default in SETTINGS_DEFAULTS.items():
+        if overrides.get(key) is not None:
+            resolved[key] = (overrides[key], "flag")
+        elif key in stored:
+            resolved[key] = (stored[key], "file")
+        else:
+            resolved[key] = (default, "default")
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Command line
+#
+# `cb` is two CLIs sharing a name: its own subcommands, and a passthrough to
+# claude for the common case. The split has to happen before argparse, because
+# argparse would choke on claude's flags — and would be wrong to reject them.
+# ---------------------------------------------------------------------------
+
+SUBCOMMANDS = (
+    "up",
+    "down",
+    "ls",
+    "exec",
+    "shell",
+    "recreate",
+    "rebuild-image",
+    "update-claude",
+    "config",
+)
+
+# Everything after these is a command line of its own and is left untouched:
+# `cb exec docker ps --force` passes --force to docker, not to cb.
+VERBATIM_SUBCOMMANDS = ("exec",)
+
+# The flags cb keeps for itself. Deliberately short — every name here is one
+# claude can never be given without `--`. Checked against claude's flags; there
+# is no overlap today.
+TOGGLE_FLAGS = {
+    "--docker": ("docker", True),
+    "--no-docker": ("docker", False),
+    "--force": ("force", True),
+}
+SWITCH_FLAGS = {
+    "--no-attach": "no_attach",
+    "-y": "yes",
+    "--yes": "yes",
+    "--dry-run": "dry_run",
+    "-h": "help",
+    "--help": "help",
+}
+
+
+def pick_subcommand(argv):
+    """Split argv into a subcommand and the arguments that follow it.
+
+    Only the first token is considered. Anything else is claude's line, where a
+    word that happens to match a subcommand name is just a word: `cb -p down`
+    asks claude about something called down.
+    """
+    if argv and argv[0] in SUBCOMMANDS:
+        return argv[0], list(argv[1:])
+    return "up", list(argv)
+
+
+def extract_flags(args):
+    """Pull cb's reserved flags out of a line that otherwise belongs to claude.
+
+    Returns (flags, rest). Toggles are tri-state: None means the flag was not
+    given and the stored setting stands, True and False are the two spellings of
+    an explicit answer.
+
+    Reserved flags are recognised wherever they appear, because the surrounding
+    arguments belong to claude and cannot be reordered around a fixed position.
+    `--` ends the search; what precedes it has already been taken.
+    """
+    flags = {
+        "docker": None,
+        "force": None,
+        "yes": False,
+        "dry_run": False,
+        "help": False,
+        "no_attach": False,
+    }
+    rest = []
+
+    args = list(args)
+    while args:
+        arg = args.pop(0)
+        if arg == "--":
+            rest.extend(args)
+            break
+        if arg in TOGGLE_FLAGS:
+            key, value = TOGGLE_FLAGS[arg]
+            flags[key] = value
+        elif arg in SWITCH_FLAGS:
+            flags[SWITCH_FLAGS[arg]] = True
+        else:
+            rest.append(arg)
+
+    return flags, rest
+
+
+# ---------------------------------------------------------------------------
+# Image features
+#
+# The toolchains in the image are optional at build time. They are a property
+# of the image and not of a box: one image, one tag, so a lean set costs
+# nothing to resolve and cannot leave two boxes fighting over a tag.
+#
+# All default to on, which is what keeps a bare `docker build` in
+# .config/claude-box producing the intended image — the Dockerfile is built
+# directly so that the result gets one fixed name rather than the per-workspace
+# name the devcontainer CLI would choose.
+# ---------------------------------------------------------------------------
+
+IMAGE_FEATURES = ("docker", "go", "playwright", "rust", "sqlx")
+
+# The image carries its own answer as a label, so `docker inspect` stays
+# authoritative even when the state file has been lost or hand-edited. The file
+# only remembers what to build next time.
+FEATURE_LABEL = "cb.features"
+
+
+def extract_feature_flags(args):
+    """Pull --with-X / --without-X out of `args`, leaving everything else."""
+    overrides = {feature: None for feature in IMAGE_FEATURES}
+    rest = []
+    for arg in args:
+        if arg.startswith("--with-") and arg[len("--with-"):] in overrides:
+            overrides[arg[len("--with-"):]] = True
+        elif arg.startswith("--without-") and arg[len("--without-"):] in overrides:
+            overrides[arg[len("--without-"):]] = False
+        else:
+            rest.append(arg)
+    return overrides, rest
+
+
+def resolve_features(stored, overrides):
+    """Effective feature set: flag beats file beats on.
+
+    sqlx-cli is a cargo build, so it cannot outlive the toolchain: dropping rust
+    drops it too. Asking for both at once is refused rather than resolved,
+    because either answer contradicts one of the two flags.
+    """
+    if overrides.get("rust") is False and overrides.get("sqlx") is True:
+        raise UsageError("--with-sqlx needs rust; drop --without-rust")
+
+    features = {}
+    for feature in IMAGE_FEATURES:
+        if overrides.get(feature) is not None:
+            features[feature] = overrides[feature]
+        elif feature in stored:
+            features[feature] = bool(stored[feature])
+        else:
+            features[feature] = True
+
+    if not features["rust"]:
+        features["sqlx"] = False
+    return features
+
+
+def feature_label(features):
+    """The label value baked into the image."""
+    return ",".join(
+        "{}={}".format(name, int(value)) for name, value in sorted(features.items())
+    )
+
+
+def parse_feature_label(label):
+    """Read back what feature_label wrote.
+
+    Unknown and malformed entries are dropped rather than raising: the label is
+    read from whatever image happens to be tagged claude-box:latest, which may
+    predate the feature it is being asked about.
+    """
+    features = {}
+    for entry in (label or "").split(","):
+        name, _, value = entry.partition("=")
+        if name in IMAGE_FEATURES and value in ("0", "1"):
+            features[name] = value == "1"
+    return features
+
+
+def feature_build_args(features):
+    """`WITH_X=…` assignments, one per feature, for `docker build --build-arg`."""
+    return [
+        "WITH_{}={}".format(name.upper(), int(value))
+        for name, value in sorted(features.items())
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The directory gate
+#
+# A box bind-mounts the directory it is launched from and hands it to an agent
+# with permissions loosened, so starting one in the wrong place — $HOME, /, a
+# directory reached by a stray cd — is the expensive mistake. Checkouts live in
+# ~/git and scratch work in ~/tmp; anything else is a typo until --force says
+# otherwise, and --force is remembered per box.
+# ---------------------------------------------------------------------------
+
+DEFAULT_ROOTS = ("~/git", "~/tmp")
+
+
+def roots():
+    """Where boxes may be started. CB_ROOTS overrides, colon separated."""
+    configured = os.environ.get("CB_ROOTS")
+    entries = configured.split(":") if configured else DEFAULT_ROOTS
+    return [os.path.expanduser(entry) for entry in entries if entry]
+
+
+def in_roots(path, allowed):
+    """Is `path` one of `allowed`, or below one?
+
+    Compares resolved paths, so a symlinked ~/git — or a cd through one — still
+    counts, and a root that does not exist simply never matches. The separator
+    in the prefix test is what keeps ~/gitignored from passing as ~/git.
+    """
+    here = os.path.realpath(path)
+    for root in allowed:
+        if not os.path.isdir(root):
+            continue
+        resolved = os.path.realpath(root)
+        if here == resolved or here.startswith(resolved.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Running things
+# ---------------------------------------------------------------------------
+
+
+def run(argv, env=None, quiet=False, check=True):
+    """Run `argv`, inheriting the terminal unless `quiet`."""
+    if DRY_RUN:
+        print("+ " + shlex.join(argv))
+        return 0
+    try:
+        completed = subprocess.run(
+            argv,
+            env=env,
+            stdout=subprocess.DEVNULL if quiet else None,
+        )
+    except FileNotFoundError:
+        raise MissingBinary(argv[0])
+    if check and completed.returncode:
+        raise command_failed(argv[0], completed.returncode)
+    return completed.returncode
+
+
+def capture(argv):
+    """Standard output of `argv`, or None if it failed.
+
+    Failure is an answer here, not an error: "no such container" and "no such
+    image" are both routine and both arrive this way.
+    """
+    try:
+        completed = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except FileNotFoundError:
+        raise MissingBinary(argv[0])
+    if completed.returncode:
+        return None
+    return completed.stdout.decode()
+
+
+def command_failed(name, code):
+    """A failed subprocess, reported with its own exit code rather than cb's."""
+    error = CbError("{} exited {}".format(name, code))
+    error.code = code
+    return error
+
+
+def confirm(question, assume_yes):
+    """Ask, unless -y was given or there is nobody to ask."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(question + " [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+# ---------------------------------------------------------------------------
+# Docker
+#
+# Boxes are found by the labels the devcontainer CLI stamps on them — the host
+# folder it was launched from, and the config that produced it — rather than by
+# name. The name carries a hash and says less.
+# ---------------------------------------------------------------------------
+
+FOLDER_LABEL = "devcontainer.local_folder"
+CONFIG_LABEL = "devcontainer.config_file"
+
+# `-a` rather than plain `ps`: a stopped box is still a box.
+PS_TABLE = 'table {{.Names}}\t{{.Status}}\t{{.Label "devcontainer.local_folder"}}'
+
+
+def label_filter(label, value=None):
+    term = label if value is None else "{}={}".format(label, value)
+    return ["--filter", "label=" + term]
+
+
+def docker_names(filters):
+    out = capture(["docker", "ps", "-a", "--format", "{{.Names}}"] + filters)
+    if out is None:
+        raise CbError("docker is not answering — is the daemon running?")
+    return [line for line in out.splitlines() if line]
+
+
+def docker_table(filters):
+    out = capture(["docker", "ps", "-a", "--format", PS_TABLE] + filters)
+    if out is None:
+        raise CbError("docker is not answering — is the daemon running?")
+    return out.rstrip("\n")
+
+
+def docker_remove(names):
+    """Remove containers by name, and say which.
+
+    Never -v: cb-history-<id> holds the shell history and a teardown must not
+    take it along. The Claude config is a bind mount of the host's ~/.claude and
+    is out of reach of -v either way, so only container state is lost.
+    """
+    run(["docker", "rm", "-f"] + names, quiet=True)
+    if not DRY_RUN:
+        print("removed: " + " ".join(names))
+
+
+def box_for(workspace):
+    """The container started from `workspace`, if there is one."""
+    names = docker_names(label_filter(FOLDER_LABEL, workspace))
+    return names[0] if names else None
+
+
+def is_privileged(name):
+    out = capture(["docker", "inspect", "--format", "{{.HostConfig.Privileged}}", name])
+    return None if out is None else out.strip() == "true"
+
+
+# ---------------------------------------------------------------------------
+# The image
+# ---------------------------------------------------------------------------
+
+
+def image_state_path():
+    return os.path.join(state_dir(), "image.json")
+
+
+def claude_version():
+    """Newest published claude-code version, as a concrete value.
+
+    "latest" would be useless as a build arg: Docker caches a RUN layer by its
+    instruction text, not by what the tag resolved to, so `npm install …@latest`
+    stays frozen forever. A concrete version changes the text exactly when a
+    release happens.
+
+    Any failure falls back to "latest", which simply leaves the layer cached.
+    The scope separator has to be encoded — the registry reads an unescaped
+    slash as a path.
+    """
+    url = "https://registry.npmjs.org/{}/latest".format(
+        CLAUDE_PACKAGE.replace("/", "%2f")
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            return json.load(response)["version"]
+    except Exception:
+        return "latest"
+
+
+def image_exists():
+    return capture(["docker", "image", "inspect", CB_IMAGE]) is not None
+
+
+def image_features():
+    """What the image on disk was built with, or None if there is no image.
+
+    Read from the image's own label rather than from image.json, so the answer
+    stays right when the state file has been lost or hand-edited.
+    """
+    out = capture(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            '{{index .Config.Labels "%s"}}' % FEATURE_LABEL,
+            CB_IMAGE,
+        ]
+    )
+    return None if out is None else parse_feature_label(out.strip())
+
+
+def build_image(features, no_cache=False):
+    argv = ["docker", "build"]
+    if no_cache:
+        argv.append("--no-cache")
+    argv += ["--build-arg", "CLAUDE_CODE_VERSION=" + claude_version()]
+    for assignment in feature_build_args(features):
+        argv += ["--build-arg", assignment]
+    argv += ["--tag", CB_IMAGE, CB_DIR]
+    run(argv)
+
+
+def ensure_image():
+    """Build only what is missing.
+
+    The image has to exist before a container can run, but keeping it current is
+    update-claude's job, not something every `cb` pays for: `cb` runs many times
+    a day and almost always on a warm cache, where a build is a registry round
+    trip plus twenty lines of CACHED that read like a rebuild.
+    """
+    if image_exists():
+        return
+    build_image(resolve_features(read_json(image_state_path()), {}))
+
+
+# ---------------------------------------------------------------------------
+# The devcontainer CLI
+#
+# Every call has to agree on the config, because the CLI finds an existing
+# container by labels that include the config path. Mixing them would start a
+# second container for the same folder.
+#
+# CB_PROJECT and CB_NAME reach devcontainer.json through ${localEnv:…}. They
+# live here rather than in the JSON because the only variable the CLI offers,
+# ${localWorkspaceFolderBasename}, is neither sanitized nor unique.
+# ---------------------------------------------------------------------------
+
+
+def dc_env(workspace, docker):
+    env = dict(os.environ)
+    env["CB_PROJECT"] = slug(os.path.basename(workspace))
+    env["CB_NAME"] = container_name(workspace)
+    env["CB_DIND"] = "true" if docker else "false"
+    return env
+
+
+def dc_up(workspace, docker, recreate=False, quiet=False, extra=()):
+    argv = ["devcontainer", "up", "--workspace-folder", workspace, "--config", CB_CONFIG]
+    if recreate:
+        argv.append("--remove-existing-container")
+    argv += list(extra)
+    run(argv, env=dc_env(workspace, docker), quiet=quiet)
+
+
+def dc_exec(workspace, docker, command):
+    """Hand the terminal to a command inside the box, and do not come back.
+
+    execvpe rather than a subprocess: the exit code, the signals and the TTY all
+    belong to claude, and cb has nothing left to do once it has started.
+    """
+    argv = [
+        "devcontainer",
+        "exec",
+        "--workspace-folder",
+        workspace,
+        "--config",
+        CB_CONFIG,
+        "--",
+    ] + list(command)
+    if DRY_RUN:
+        print("+ " + shlex.join(argv))
+        return
+    try:
+        os.execvpe(argv[0], argv, dc_env(workspace, docker))
+    except FileNotFoundError:
+        raise MissingBinary(argv[0])
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def box_settings(workspace, flags):
+    """This box's effective settings, and the overrides that shaped them.
+
+    Resolving and remembering are two steps so that nothing is written before
+    the gate has had its say — a directory cb refuses to start in must not be
+    left with a settings file behind it.
+    """
+    overrides = {"docker": flags["docker"], "force": flags["force"]}
+    stored = load_settings(settings_path(workspace))
+    return resolve_settings(stored, overrides), overrides
+
+
+def remember(workspace, overrides):
+    """Persist whatever the flags decided, so the next run needs no flags."""
+    if any(value is not None for value in overrides.values()):
+        save_settings(settings_path(workspace), overrides, workspace)
+
+
+def check_gate(workspace, force):
+    """Refuse to create a box outside the roots.
+
+    Only applies where a box would be created: one that already exists was
+    gated when it was made, and refusing to restart it would strand it.
+    """
+    if force or in_roots(workspace, roots()):
+        return
+    raise UsageError(
+        "refusing to start a claude box in {}\n"
+        "boxes belong under {} — pass --force to override".format(
+            workspace, " or ".join(roots())
+        )
+    )
+
+
+def check_docker_feature(docker):
+    """Container privilege and the docker binaries are two different things.
+
+    A privileged box built from an image without docker.io gets a daemon that
+    cannot start, and the only trace is a line in cb-dockerd's log inside the
+    container. Catch it here instead.
+    """
+    if not docker:
+        return
+    features = image_features()
+    if features is not None and features.get("docker") is False:
+        raise UsageError(
+            "this box wants docker but {} was built without it\n"
+            "run: cb rebuild-image --with-docker".format(CB_IMAGE)
+        )
+
+
+def reconcile(workspace, box, docker, assume_yes):
+    """Recreate the box if its privileges no longer match the settings.
+
+    --privileged applies at creation time only, so a box created without docker
+    keeps running without it however often it is restarted. This is the failure
+    the old --dind flag could not prevent, because nothing compared the request
+    against the container that already existed.
+    """
+    actual = is_privileged(box)
+    if actual is None or actual == docker:
+        return False
+    print(
+        "{}: settings say docker={}, the container was created with docker={}".format(
+            box, str(docker).lower(), str(actual).lower()
+        )
+    )
+    if not confirm("recreate it?", assume_yes):
+        return False
+    return True
+
+
+def cmd_up(flags, claude_args):
+    workspace = os.getcwd()
+    settings, overrides = box_settings(workspace, flags)
+    docker = settings["docker"][0]
+
+    box = box_for(workspace)
+    if box is None:
+        check_gate(workspace, settings["force"][0])
+    remember(workspace, overrides)
+    check_docker_feature(docker)
+    ensure_image()
+
+    recreate = box is not None and reconcile(workspace, box, docker, flags["yes"])
+    attach = not flags["no_attach"]
+    dc_up(workspace, docker, recreate=recreate, quiet=attach)
+
+    if attach:
+        dc_exec(workspace, docker, ["claude"] + claude_args)
+    return 0
+
+
+def cmd_recreate(flags, args):
+    reject_extra("recreate", args)
+    workspace = os.getcwd()
+    settings, overrides = box_settings(workspace, flags)
+    docker = settings["docker"][0]
+
+    if box_for(workspace) is None:
+        check_gate(workspace, settings["force"][0])
+    remember(workspace, overrides)
+    check_docker_feature(docker)
+    ensure_image()
+    dc_up(workspace, docker, recreate=True)
+    return 0
+
+
+def cmd_update_claude(flags, args):
+    """Pull in a new claude-code release and recreate the box to run it.
+
+    Cheap on purpose: claude-code is the last layer in the Dockerfile, so a bump
+    invalidates nothing above it. With the version unchanged every layer is a
+    cache hit and this is `recreate` with a registry lookup in front.
+    """
+    reject_extra("update-claude", args)
+    build_image(resolve_features(read_json(image_state_path()), {}))
+    return cmd_recreate(flags, [])
+
+
+def cmd_rebuild_image(flags, args):
+    """Rebuild the shared image, optionally changing which toolchains it has.
+
+    Feature flags are remembered, so a later bare `cb rebuild-image` reproduces
+    the same set. --no-cache is the nuclear option: it discards the Rust
+    toolchain, the from-source sqlx-cli build and the Playwright download, which
+    update-claude gets you without.
+    """
+    overrides, args = extract_feature_flags(args)
+    no_cache = "--no-cache" in args
+    reject_extra("rebuild-image", [arg for arg in args if arg != "--no-cache"])
+
+    features = resolve_features(read_json(image_state_path()), overrides)
+    write_json(image_state_path(), features)
+    build_image(features, no_cache=no_cache)
+
+    workspace = os.getcwd()
+    if box_for(workspace) is not None:
+        settings, _ = box_settings(workspace, flags)
+        dc_up(workspace, settings["docker"][0], recreate=True)
+    return 0
+
+
+def cmd_down(flags, args):
+    """Throw a box away. The counterpart to up: recreate is "start over now",
+    this is "I am done here"."""
+    scope = scope_of("down", args)
+    if scope == "any":
+        return down_any(flags["yes"])
+
+    if scope == "all":
+        filters = label_filter(CONFIG_LABEL, CB_CONFIG)
+        missing = "no claude box found"
+    else:
+        filters = label_filter(FOLDER_LABEL, os.getcwd())
+        missing = "no claude box for " + os.getcwd()
+
+    names = docker_names(filters)
+    if not names:
+        raise CbError(missing)
+    docker_remove(names)
+    return 0
+
+
+def down_any(assume_yes):
+    """Every devcontainer on the machine, whatever started it.
+
+    The label is queried for existence only, so VS Code's containers and other
+    projects' `devcontainer up` are in scope too — hence the listing and the
+    prompt before anything happens.
+    """
+    names = docker_names(label_filter(FOLDER_LABEL))
+    if not names:
+        raise CbError("no devcontainer found")
+    print(docker_table(label_filter(FOLDER_LABEL)))
+    print()
+    if not confirm("remove {} devcontainer(s)?".format(len(names)), assume_yes):
+        raise CbError("aborted")
+    docker_remove(names)
+    return 0
+
+
+def cmd_ls(flags, args):
+    scope = scope_of("ls", args, allow_all=False)
+    if scope == "any":
+        print(docker_table(label_filter(FOLDER_LABEL)))
+    else:
+        print(docker_table(label_filter(CONFIG_LABEL, CB_CONFIG)))
+    return 0
+
+
+def cmd_exec(args):
+    if not args:
+        raise UsageError("cb exec needs a command")
+    workspace = os.getcwd()
+    settings = resolve_settings(load_settings(settings_path(workspace)), {})
+    dc_exec(workspace, settings["docker"][0], args)
+    return 0
+
+
+def cmd_shell(flags, args):
+    reject_extra("shell", args)
+    return cmd_exec(["zsh"])
+
+
+def cmd_config(flags, args):
+    if args == ["--prune"]:
+        return prune_settings()
+    if len(args) == 2:
+        return set_setting(args[0], args[1])
+    if len(args) == 1:
+        return show_setting(args[0])
+    reject_extra("config", args)
+
+    workspace = os.getcwd()
+    settings = resolve_settings(load_settings(settings_path(workspace)), {})
+    for key in sorted(settings):
+        value, source = settings[key]
+        print("{:<8} {:<6} ({})".format(key, str(value).lower(), source))
+
+    features = image_features()
+    if features is None:
+        print("\nimage    {} is not built".format(CB_IMAGE))
+    else:
+        enabled = sorted(name for name, on in features.items() if on) or ["none"]
+        print("\nimage    {}  {}".format(CB_IMAGE, " ".join(enabled)))
+    return 0
+
+
+def show_setting(key):
+    workspace = os.getcwd()
+    settings = resolve_settings(load_settings(settings_path(workspace)), {})
+    if key not in settings:
+        raise UsageError(
+            "unknown setting: {} (known: {})".format(
+                key, " ".join(sorted(SETTINGS_DEFAULTS))
+            )
+        )
+    value, source = settings[key]
+    print("{} {} ({})".format(key, str(value).lower(), source))
+    return 0
+
+
+def set_setting(key, value):
+    if key not in SETTINGS_DEFAULTS:
+        raise UsageError(
+            "unknown setting: {} (known: {})".format(
+                key, " ".join(sorted(SETTINGS_DEFAULTS))
+            )
+        )
+    if value not in ("true", "false"):
+        raise UsageError("{} takes true or false, not {}".format(key, value))
+    workspace = os.getcwd()
+    save_settings(settings_path(workspace), {key: value == "true"}, workspace)
+    print("{} {} ({})".format(key, value, settings_path(workspace)))
+    return 0
+
+
+def prune_settings():
+    """Drop entries whose directory is gone.
+
+    The store is keyed by path, so a deleted checkout leaves a file behind that
+    nothing will ever read again.
+    """
+    directory = os.path.join(state_dir(), "projects")
+    removed = []
+    for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+        path = os.path.join(directory, name)
+        workspace = read_json(path).get("path")
+        if workspace and not os.path.isdir(workspace):
+            if DRY_RUN:
+                print("+ rm " + path)
+            else:
+                os.remove(path)
+            removed.append(workspace)
+    print("pruned: " + ", ".join(removed) if removed else "nothing to prune")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+USAGE = """usage: cb [command] [options]
+
+  cb [up] [claude args…]   start the box and run claude in it (default)
+  cb up --no-attach        start the box and stop there
+  cb shell                 zsh inside the box
+  cb exec CMD…             run CMD inside the box
+  cb down [--all|--any]    remove this box, every cb box, or every devcontainer
+  cb ls [--any]            list cb boxes, or every devcontainer
+  cb recreate              replace the container, keeping the image
+  cb update-claude         rebuild with the newest claude-code, then recreate
+  cb rebuild-image [--no-cache] [--with-X|--without-X]…
+  cb config [KEY [VALUE]] [--prune]
+
+options
+  --docker, --no-docker    give this box its own docker daemon; remembered
+  --force                  allow a box outside {roots}; remembered
+  -y                       do not ask
+  --dry-run                print the commands instead of running them
+  --                       stop reading options; the rest is claude's
+
+image features: {features}
+""".format(roots=" and ".join(DEFAULT_ROOTS), features=" ".join(IMAGE_FEATURES))
+
+
+def reject_extra(command, args):
+    """An unknown argument is refused rather than ignored.
+
+    A typo must not quietly hand back something other than what was asked for —
+    the reason the old --dind parsing rejected them too.
+    """
+    if args:
+        raise UsageError("cb {}: unexpected argument: {}".format(command, args[0]))
+
+
+def scope_of(command, args, allow_all=True):
+    """Read the scope flags shared by ls and down."""
+    scopes = {"--any": "any"}
+    if allow_all:
+        scopes["--all"] = "all"
+        scopes["-a"] = "all"
+
+    chosen = "here"
+    rest = []
+    for arg in args:
+        if arg in scopes:
+            chosen = scopes[arg]
+        else:
+            rest.append(arg)
+    reject_extra(command, rest)
+    return chosen
+
+
+COMMANDS = {
+    "up": cmd_up,
+    "down": cmd_down,
+    "ls": cmd_ls,
+    "shell": cmd_shell,
+    "recreate": cmd_recreate,
+    "rebuild-image": cmd_rebuild_image,
+    "update-claude": cmd_update_claude,
+    "config": cmd_config,
+}
+
+
+def main(argv):
+    global DRY_RUN
+
+    name, rest = pick_subcommand(argv)
+
+    # exec takes a command line of its own: `cb exec docker ps --force` passes
+    # --force to docker, so nothing may be read out of it here.
+    if name in VERBATIM_SUBCOMMANDS:
+        return cmd_exec(rest)
+
+    flags, args = extract_flags(rest)
+    if flags["help"]:
+        print(USAGE, end="")
+        return 0
+    DRY_RUN = flags["dry_run"]
+
+    return COMMANDS[name](flags, args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except CbError as error:
+        print("cb: " + str(error), file=sys.stderr)
+        sys.exit(error.code)
+    except KeyboardInterrupt:
+        sys.exit(130)

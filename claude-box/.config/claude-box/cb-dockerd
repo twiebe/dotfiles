@@ -28,7 +28,7 @@ fi
 
 # /var/lib/docker deliberately has no volume: images and containers built inside
 # a box are scratch space. It lives on the container's writable layer, which
-# cbrecreate throws away; the wipe here covers the other case, a plain restart
+# `cb recreate` throws away; the wipe here covers the other case, a plain restart
 # of the same container.
 #
 # Mounts below it only exist when a previous dockerd was killed without cleaning

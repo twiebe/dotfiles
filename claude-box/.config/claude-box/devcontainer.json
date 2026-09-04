@@ -5,8 +5,8 @@
   // With "build" the devcontainer CLI names the result vsc-<folder>-<hash of
   // the workspace path>, i.e. one image per repo, and `up` has no way to
   // override that name. The Dockerfile next to this file produces this tag;
-  // the shell functions build it before calling `up`. Keep the tag in sync
-  // with CB_IMAGE in 90-claude-box.zsh.
+  // cb builds it before calling `up`. Keep the tag in sync with CB_IMAGE in
+  // ~/.local/bin/cb.
   "image": "claude-box:latest",
   "customizations": {
     "vscode": {
@@ -28,9 +28,9 @@
   // is only a display label for editors, so the actual name has to come from a
   // docker run flag.
   //
-  // _cb_name() in 90-claude-box.zsh builds cb-<project>-<path hash>; the hash
-  // keeps two checkouts of the same directory name apart. The fallback only
-  // applies to a hand-written `devcontainer up` outside those functions.
+  // container_name() in cb builds cb-<project>-<path hash>; the hash keeps two
+  // checkouts of the same directory name apart. The fallback only applies to a
+  // hand-written `devcontainer up` outside cb.
   //
   // --privileged is what lets dockerd inside the box mount, write cgroups and
   // program iptables. Spelled with an explicit value rather than as a bare
