@@ -93,8 +93,8 @@ wrappers, image, gate, commands, CLI.
 | `cb down [--all\|--any]` | `cbdown`, `dcdown` | |
 | `cb ls [--any]` | `cbls`, `dcls` | |
 | `cb recreate` | `cbrecreate` | Container only; image untouched |
-| `cb update-claude` | `cbupdate` | Resolve version, cached build, recreate |
-| `cb rebuild-image [--no-cache]` | `cbrebuild` | `--no-cache` is the old nuclear option |
+| `cb update-claude` | `cbupdate` | Resolve version, cached build, recreate a box that exists |
+| `cb rebuild-image [--no-cache]` | `cbrebuild` | Builds only; `--no-cache` is the old nuclear option |
 | `cb config [KEY [VALUE]]` | — | Show or set, with provenance |
 
 Scope flags are consistent across `ls` and `down`: no flag means this directory,
@@ -238,6 +238,13 @@ start. `cb up` catches that and names `cb rebuild-image --with-docker` as the
 fix, instead of letting it fail in `cb-dockerd`'s log.
 
 `cb config` prints the image's feature set alongside the box settings.
+
+Neither `cb rebuild-image` nor `cb update-claude` creates a box. The image is
+shared, so recreating whichever box happens to sit in the current directory
+would be an arbitrary half-measure, and in a directory without one it would
+make a container as a side effect of a build. `rebuild-image` therefore builds
+and stops; `update-claude` recreates only a box that already exists, because
+running the new binary is its point. Both say what they left alone.
 
 ## Error handling
 
