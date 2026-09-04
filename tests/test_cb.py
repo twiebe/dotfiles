@@ -6,16 +6,23 @@ which is the part that used to fail silently in the zsh version.
 
 cb has no .py extension — it is an executable on PATH — so it is loaded by path
 rather than imported by name.
+
+These live outside claude-box/ deliberately. Every top-level entry of a stow
+package is mapped into the target, so claude-box/tests/ would land in $HOME; the
+alternative, a .stow-local-ignore, replaces stow's entire default ignore list
+rather than adding to it, which would quietly start stowing backup files and
+.gitignore the day one appears in that directory.
 """
 
 import contextlib
 import importlib.util
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-CB_PATH = Path(__file__).resolve().parents[1] / ".local" / "bin" / "cb"
+CB_PATH = Path(__file__).resolve().parents[1] / "claude-box" / ".local" / "bin" / "cb"
 
 
 def _load_cb():
@@ -96,6 +103,48 @@ class ContainerNameTest(unittest.TestCase):
     def test_joins_the_prefix_slug_and_hash(self):
         name = cb.container_name("/home/user/git/My_Repo")
         self.assertEqual(name, "cb-my-repo-" + cb.path_hash("/home/user/git/My_Repo"))
+
+
+class WorkspaceTest(unittest.TestCase):
+    """The workspace path is what the container name is hashed from, so it has
+    to be spelled the way the shell spells it: os.getcwd() resolves symlinks and
+    $PWD does not, and a checkout reached through a symlink would otherwise get
+    a second identity and a second box."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name).resolve()
+        self.real = base / "real"
+        self.real.mkdir()
+        self.link = base / "link"
+        self.link.symlink_to(self.real)
+
+        self.addCleanup(os.chdir, os.getcwd())
+        self.addCleanup(os.environ.pop, "PWD", None)
+        os.chdir(str(self.real))
+
+    def test_prefers_the_shells_spelling(self):
+        os.environ["PWD"] = str(self.link)
+        self.assertEqual(cb.current_workspace(), str(self.link))
+
+    def test_falls_back_when_pwd_is_stale(self):
+        # A subshell that chdir'd without updating PWD, or an exported PWD from
+        # somewhere else entirely.
+        os.environ["PWD"] = str(self.real.parent)
+        self.assertEqual(cb.current_workspace(), str(self.real))
+
+    def test_falls_back_when_pwd_names_nothing(self):
+        os.environ["PWD"] = str(self.real / "gone")
+        self.assertEqual(cb.current_workspace(), str(self.real))
+
+    def test_falls_back_when_pwd_is_unset(self):
+        os.environ.pop("PWD", None)
+        self.assertEqual(cb.current_workspace(), str(self.real))
+
+    def test_falls_back_when_pwd_is_relative(self):
+        os.environ["PWD"] = "."
+        self.assertEqual(cb.current_workspace(), str(self.real))
 
 
 class ResolveSettingsTest(unittest.TestCase):

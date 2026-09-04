@@ -84,6 +84,29 @@ def path_hash(path):
     return hashlib.sha256(path.encode()).hexdigest()[:8]
 
 
+def current_workspace():
+    """The directory this box belongs to, spelled the way the shell spells it.
+
+    os.getcwd() resolves symlinks; the shell's $PWD does not. The path is what
+    the container name is hashed from and what the CLI stamps on the container
+    as its local_folder label, so the two spellings are two identities and two
+    boxes for one checkout. Preferring $PWD keeps a checkout reached through a
+    symlink at one box, and keeps cb finding the boxes the zsh version created.
+
+    $PWD is only believed when it still names this directory: a subshell that
+    chdir'd without updating it, or an exported value from somewhere else, would
+    otherwise rename the box.
+    """
+    logical = os.environ.get("PWD")
+    if logical and os.path.isabs(logical):
+        try:
+            if os.path.samefile(logical, os.getcwd()):
+                return logical
+        except OSError:
+            pass
+    return os.getcwd()
+
+
 def container_name(path):
     return "{}-{}-{}".format(NAME_PREFIX, slug(os.path.basename(path)), path_hash(path))
 
@@ -743,13 +766,23 @@ def reconcile(workspace, box, docker, assume_yes):
             box, str(docker).lower(), str(actual).lower()
         )
     )
-    if not confirm("recreate it?", assume_yes):
-        return False
-    return True
+    if confirm("recreate it?", assume_yes):
+        return True
+
+    # Declining is allowed — the box still works, just not the way the settings
+    # describe. Saying so on stderr is what keeps the mismatch from resurfacing
+    # as a daemon that will not start, with the only trace inside the container.
+    print(
+        "cb: continuing with docker={}; run `cb recreate` to apply docker={}".format(
+            str(actual).lower(), str(docker).lower()
+        ),
+        file=sys.stderr,
+    )
+    return False
 
 
 def cmd_up(flags, claude_args):
-    workspace = os.getcwd()
+    workspace = current_workspace()
     settings, overrides = box_settings(workspace, flags)
     docker = settings["docker"][0]
 
@@ -757,8 +790,8 @@ def cmd_up(flags, claude_args):
     if box is None:
         check_gate(workspace, settings["force"][0])
     remember(workspace, overrides)
-    check_docker_feature(docker)
     ensure_image()
+    check_docker_feature(docker)
 
     recreate = box is not None and reconcile(workspace, box, docker, flags["yes"])
     attach = not flags["no_attach"]
@@ -771,15 +804,15 @@ def cmd_up(flags, claude_args):
 
 def cmd_recreate(flags, args):
     reject_extra("recreate", args)
-    workspace = os.getcwd()
+    workspace = current_workspace()
     settings, overrides = box_settings(workspace, flags)
     docker = settings["docker"][0]
 
     if box_for(workspace) is None:
         check_gate(workspace, settings["force"][0])
     remember(workspace, overrides)
-    check_docker_feature(docker)
     ensure_image()
+    check_docker_feature(docker)
     dc_up(workspace, docker, recreate=True)
     return 0
 
@@ -812,7 +845,7 @@ def cmd_rebuild_image(flags, args):
     write_json(image_state_path(), features)
     build_image(features, no_cache=no_cache)
 
-    workspace = os.getcwd()
+    workspace = current_workspace()
     if box_for(workspace) is not None:
         settings, _ = box_settings(workspace, flags)
         dc_up(workspace, settings["docker"][0], recreate=True)
@@ -830,8 +863,9 @@ def cmd_down(flags, args):
         filters = label_filter(CONFIG_LABEL, CB_CONFIG)
         missing = "no claude box found"
     else:
-        filters = label_filter(FOLDER_LABEL, os.getcwd())
-        missing = "no claude box for " + os.getcwd()
+        workspace = current_workspace()
+        filters = label_filter(FOLDER_LABEL, workspace)
+        missing = "no claude box for " + workspace
 
     names = docker_names(filters)
     if not names:
@@ -870,7 +904,7 @@ def cmd_ls(flags, args):
 def cmd_exec(args):
     if not args:
         raise UsageError("cb exec needs a command")
-    workspace = os.getcwd()
+    workspace = current_workspace()
     settings = resolve_settings(load_settings(settings_path(workspace)), {})
     dc_exec(workspace, settings["docker"][0], args)
     return 0
@@ -890,7 +924,7 @@ def cmd_config(flags, args):
         return show_setting(args[0])
     reject_extra("config", args)
 
-    workspace = os.getcwd()
+    workspace = current_workspace()
     settings = resolve_settings(load_settings(settings_path(workspace)), {})
     for key in sorted(settings):
         value, source = settings[key]
@@ -906,7 +940,7 @@ def cmd_config(flags, args):
 
 
 def show_setting(key):
-    workspace = os.getcwd()
+    workspace = current_workspace()
     settings = resolve_settings(load_settings(settings_path(workspace)), {})
     if key not in settings:
         raise UsageError(
@@ -928,7 +962,7 @@ def set_setting(key, value):
         )
     if value not in ("true", "false"):
         raise UsageError("{} takes true or false, not {}".format(key, value))
-    workspace = os.getcwd()
+    workspace = current_workspace()
     save_settings(settings_path(workspace), {key: value == "true"}, workspace)
     print("{} {} ({})".format(key, value, settings_path(workspace)))
     return 0
