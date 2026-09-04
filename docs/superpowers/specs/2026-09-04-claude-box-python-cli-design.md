@@ -54,8 +54,7 @@ claude-box/
   .local/bin/cb                  # the CLI: one file, stdlib only, no extension
   .config/claude-box/            # devcontainer.json, Dockerfile, cb-dockerd
   .zshrc.d/90-claude-box.zsh     # shrinks to a completion function + `cbc` alias
-  tests/test_cb.py
-  .stow-local-ignore             # keeps tests/ out of $HOME
+tests/test_cb.py                 # outside the package, see below
 ```
 
 Two placement constraints, both consequences of stow:
@@ -67,9 +66,13 @@ to `${XDG_STATE_HOME:-~/.local/state}/claude-box/` instead. The alternative,
 remembering `stow --no-folding` forever, is one forgotten flag away from the
 same bug.
 
-**`claude-box/tests/` would stow to `~/tests`.** Stow maps every top-level entry
-of a package into the target, so the package needs a `.stow-local-ignore`
-containing `^/tests$`.
+**Tests cannot live inside the package either.** Stow maps every top-level
+entry of a package into the target, so `claude-box/tests/` would land in
+`$HOME`. A `.stow-local-ignore` would exclude it, but supplying that file
+*replaces* stow's entire default ignore list rather than adding to it, which
+would quietly start stowing backup files and `.gitignore` the day one appears
+there. The tests go in a top-level `tests/`, alongside `docs/` — neither is a
+stow package.
 
 Target Python 3.9 — the system `python3` on macOS — and the standard library
 only. `subprocess` for docker and devcontainer, `urllib` for the registry
@@ -245,8 +248,8 @@ unwrapped.
 
 ## Testing
 
-`python3 -m unittest discover claude-box/tests`, standard library only. Covers
-the pure functions:
+`python3 -m unittest discover tests`, standard library only. Covers the pure
+functions:
 
 - slug edge cases: `.dotfiles` → `dotfiles`, all-punctuation → `box`, runs of
   dashes collapsed, edges trimmed, lowercased
@@ -254,6 +257,9 @@ the pure functions:
 - settings merge and provenance, including flag-over-file-over-default
 - argument splitting: subcommand detection, cb flags recognized at any position,
   `--` terminating cb's parsing
+- the workspace path: `$PWD` preferred over `os.getcwd()` so a checkout reached
+  through a symlink keeps one identity, with a fallback when `$PWD` is stale,
+  relative, or gone
 
 Code that shells out to docker is not unit tested.
 
@@ -261,7 +267,10 @@ Code that shells out to docker is not unit tested.
 
 The slug and path-hash algorithms are unchanged, so existing containers keep
 their names and labels and `cb ls` and `cb down` find boxes the zsh version
-created. `devcontainer.json` needs no edit: `CB_DIND` still arrives through the
+created. That holds only if cb hashes the path the same way the shell spelled
+it: `os.getcwd()` resolves symlinks and zsh's `$PWD` does not, so cb reads
+`$PWD` and falls back to `os.getcwd()` when it no longer names this directory.
+`devcontainer.json` needs no edit: `CB_DIND` still arrives through the
 environment, cb merely sources it from the settings file instead of a flag.
 
 Boxes created from a project-local `.devcontainer/` become invisible to cb, as
