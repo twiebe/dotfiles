@@ -4,6 +4,10 @@ CB_CONFIG="$CB_DIR/devcontainer.json"
 # Must match the "image" field in $CB_CONFIG.
 CB_IMAGE="claude-box:latest"
 
+# Directories a box may be started in. Everything else is refused unless
+# --force is passed; see _cb_gate.
+CB_ROOTS=("$HOME/git" "$HOME/tmp")
+
 # A project's own .devcontainer/ always wins; the global config is the fallback.
 _cb_local_config() {
   [ -f .devcontainer/devcontainer.json ]
@@ -102,6 +106,51 @@ _cb_ensure_image() {
   docker image inspect "$CB_IMAGE" >/dev/null 2>&1 || _cb_build "$@"
 }
 
+# Is the current directory inside one of CB_ROOTS?
+#
+# Compares resolved paths, so a symlinked ~/git — or a cd through one — still
+# counts. A root that does not exist simply never matches.
+_cb_in_roots() {
+  local here="${PWD:A}" root
+  for root in $CB_ROOTS; do
+    root="${root:A}"
+    [[ "$here" == "$root" || "$here" == "$root"/* ]] && return 0
+  done
+  return 1
+}
+
+# The directory gate, in front of every command that starts or replaces a box.
+#
+# A box bind-mounts the directory it is launched from and hands it to an agent
+# with permissions loosened, so starting one in the wrong place — $HOME, /, a
+# directory reached by a stray cd — is the expensive mistake. Checkouts live in
+# ~/git and scratch work in ~/tmp; anything else is a typo until said otherwise.
+#
+# --force says otherwise. It is consumed here rather than passed on, wherever in
+# the arguments it appears, and the rest is left in the caller's `cb_argv` for
+# the flag parsing that follows — `cb` forwards its arguments to claude, which
+# has no idea what --force means.
+#
+# The answer travels as CB_FORCE, the way --dind travels as CB_DIND: `cb`
+# gates once and cbup, called a line later, sees the decision through the
+# caller's `local CB_FORCE`. So `CB_FORCE=true cb` works too.
+_cb_gate() {
+  local -a rest
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == --force ]] && { CB_FORCE=true; continue }
+    rest+=("$arg")
+  done
+  cb_argv=("${rest[@]}")
+
+  [[ "$CB_FORCE" == true ]] && return 0
+  _cb_in_roots && return 0
+
+  print -u2 "refusing to start a claude box in $PWD"
+  print -u2 "boxes belong under ${(j: or :)CB_ROOTS} — pass --force to override"
+  return 1
+}
+
 # --dind asks for a box with its own Docker daemon: containers built inside it
 # see the same paths the box does, so a bind mount of the workspace resolves.
 # Costs --privileged, which is why it is not the default.
@@ -131,7 +180,10 @@ _cb_dind() {
 # take --dind: it would be a no-op against a container that already exists, and
 # a silently unprivileged box is the failure this whole flag exists to avoid.
 cbup() {
-  if [[ "${1:-}" == --dind ]]; then
+  local CB_FORCE="${CB_FORCE:-false}"
+  local -a cb_argv
+  _cb_gate "$@" || return
+  if [[ "${cb_argv[1]:-}" == --dind ]]; then
     print -u2 "cbup does not take --dind — --privileged applies at creation time only."
     print -u2 "use: cbrecreate --dind"
     return 1
@@ -150,8 +202,10 @@ cbexec() {
 # The volumes are untouched as always; whatever the old box had in /workspaces
 # beyond the bind mount is gone. Takes --dind (see _cb_dind).
 cbrecreate() {
-  local CB_DIND="${CB_DIND:-false}"
-  _cb_dind "$@" || return
+  local CB_DIND="${CB_DIND:-false}" CB_FORCE="${CB_FORCE:-false}"
+  local -a cb_argv
+  _cb_gate "$@" || return
+  _cb_dind "${cb_argv[@]}" || return
   _cb_ensure_image && _cb_dc up --remove-existing-container
 }
 
@@ -168,8 +222,10 @@ cbrecreate() {
 #
 # Takes --dind (see _cb_dind).
 cbupdate() {
-  local CB_DIND="${CB_DIND:-false}"
-  _cb_dind "$@" || return
+  local CB_DIND="${CB_DIND:-false}" CB_FORCE="${CB_FORCE:-false}"
+  local -a cb_argv
+  _cb_gate "$@" || return
+  _cb_dind "${cb_argv[@]}" || return
   _cb_local_config || _cb_build || return
   _cb_dc up --remove-existing-container
 }
@@ -184,8 +240,10 @@ cbupdate() {
 #
 # Takes --dind (see _cb_dind).
 cbrebuild() {
-  local CB_DIND="${CB_DIND:-false}"
-  _cb_dind "$@" || return
+  local CB_DIND="${CB_DIND:-false}" CB_FORCE="${CB_FORCE:-false}"
+  local -a cb_argv
+  _cb_gate "$@" || return
+  _cb_dind "${cb_argv[@]}" || return
   if _cb_local_config; then
     _cb_dc up --remove-existing-container --build-no-cache
   else
@@ -213,10 +271,10 @@ _cb_table() {
 
 # Remove whatever the filter matches, and report it by name.
 #
-# No -v anywhere in this file: the volumes are the entire reason coming back is
-# cheap — cb-config holds the login and the Claude config, cb-history-<id> the
-# shell history — so a teardown must never take them along. Only container
-# state is lost.
+# No -v anywhere in this file: cb-history-<id> holds the shell history and a
+# teardown must never take it along. The Claude config, which is the expensive
+# half of coming back, is a bind mount of the host's ~/.claude and is out of
+# reach of -v either way. Only container state is lost.
 _cb_rm() {
   local -a names
   names=(${(f)"$(_cb_names "$@")"})
@@ -273,8 +331,13 @@ dcls() {
   _cb_table --filter "label=devcontainer.local_folder"
 }
 
+# Gates before cbup rather than leaving it to cbup, because --force has to be
+# stripped here: everything else on the line belongs to claude.
 claude-box() {
-  cbup >/dev/null && cbexec claude "$@"
+  local CB_FORCE="${CB_FORCE:-false}"
+  local -a cb_argv
+  _cb_gate "$@" || return
+  cbup >/dev/null && cbexec claude "${cb_argv[@]}"
 }
 
 alias cb='claude-box'
