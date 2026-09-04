@@ -11,11 +11,21 @@
 # after it belongs to that stage alone. Declared further down, GO_VERSION would
 # expand to the empty string and the build would fail with
 # `invalid reference format` on "golang:-trixie".
+#
+# WITH_GO is global for the same reason. Unlike the other toggles it cannot be
+# a shell condition inside a RUN: Go arrives by COPY --from, and an `if` would
+# have to copy the 250 MB in and delete it afterwards, which leaves it in the
+# layer. The stage alias below picks an empty directory instead, so `go` names
+# something either way and the COPY at the bottom needs no knowledge of it.
 ARG UV_VERSION=0.12.1
 ARG GO_VERSION=1.26.5
+ARG WITH_GO=1
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
-FROM golang:${GO_VERSION}-trixie AS go
+FROM golang:${GO_VERSION}-trixie AS go-1
+FROM node:26-trixie-slim AS go-0
+RUN mkdir -p /usr/local/go
+FROM go-${WITH_GO} AS go
 
 # Debian trixie rather than Alpine: projects get built inside this container,
 # and musl costs more there than Alpine's fresher packages gain. Every tool
@@ -77,6 +87,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   git-lfs \
   git-delta \
   jq \
+  just \
   less \
   lua5.4 \
   pkg-config \
@@ -94,11 +105,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
-# Rust costs ~1.5 GB. It stays in the image anyway — a box that cannot build
-# the project it is pointed at is not worth the layer it saves.
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends rustup clang cbindgen just \
-  && rm -rf /var/lib/apt/lists/*
+# Rust costs ~1.5 GB with its toolchain, which is why it is the first thing
+# worth turning off in a box that never builds Rust. On by default: a box that
+# cannot build the project it is pointed at is not worth the layer it saves.
+#
+# just is not here — it is a general task runner that merely ships next to Rust
+# in Debian, and losing it with --without-rust would be a surprise. It sits in
+# the base apt block above.
+ARG WITH_RUST=1
+RUN if [ "$WITH_RUST" = 1 ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends rustup clang cbindgen \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Docker-in-Docker, used by boxes started with CB_DIND=true. Only the binaries
 # live here; the daemon is started per container by cb-dockerd, because the
@@ -121,13 +140,16 @@ RUN apt-get update \
 # not needed and would break the no-third-party-repo rule at the top of this
 # file. Note the name: docker-compose-v2 is a Ubuntu package and does not exist
 # in Debian.
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-    docker.io \
-    docker-cli \
-    docker-compose \
-    fuse-overlayfs \
-  && rm -rf /var/lib/apt/lists/*
+ARG WITH_DOCKER=1
+RUN if [ "$WITH_DOCKER" = 1 ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends \
+        docker.io \
+        docker-cli \
+        docker-compose \
+        fuse-overlayfs \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 COPY --chmod=0755 cb-dockerd /usr/local/bin/cb-dockerd
 
@@ -194,7 +216,8 @@ ENV HISTFILE=/commandhistory/.zsh_history
 ENV CARGO_HOME=/home/node/.cargo
 ENV RUSTUP_HOME=/home/node/.rustup
 ENV PATH=/home/node/.cargo/bin:$PATH
-RUN rustup default stable
+ARG WITH_RUST=1
+RUN if [ "$WITH_RUST" = 1 ]; then rustup default stable; fi
 
 # ~250 MB, and above claude-code for the same cache reason as Rust.
 #
@@ -224,10 +247,13 @@ ENV PATH=/usr/local/go/bin:/home/node/go/bin:$PATH
 # Above claude-code for the usual cache reason — this is a from-source build of
 # several minutes and must not be redone for a claude-code release.
 ARG SQLX_VERSION=0.9.0
-RUN cargo install sqlx-cli@${SQLX_VERSION} --locked \
-      --no-default-features \
-      --features rustls,postgres,mysql,sqlite,completions,sqlx-toml \
-  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
+ARG WITH_SQLX=1
+RUN if [ "$WITH_SQLX" = 1 ] && [ "$WITH_RUST" = 1 ]; then \
+      cargo install sqlx-cli@${SQLX_VERSION} --locked \
+        --no-default-features \
+        --features rustls,postgres,mysql,sqlite,completions,sqlx-toml \
+      && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"; \
+    fi
 
 # Cargo's target directory, moved off the bind mount.
 #
@@ -240,7 +266,7 @@ RUN cargo install sqlx-cli@${SQLX_VERSION} --locked \
 # One directory per box rather than per project, which is what a box already is:
 # workspaceFolder in devcontainer.json is unique per repo, so a box holds one
 # checkout. Not a volume, deliberately: this is rebuildable state, and
-# cbrecreate is supposed to hand back a clean slate.
+# `cb recreate` is supposed to hand back a clean slate.
 #
 # Must stay BELOW the `cargo install` above, otherwise that build's
 # intermediates land here and ship inside the image.
@@ -271,15 +297,29 @@ ENV CARGO_TARGET_DIR=/home/node/.cache/cargo-target
 # revision beside this one, because the cache directory is node-owned. Bump this
 # on its own schedule.
 ARG PLAYWRIGHT_VERSION=1.62.1
-RUN sudo apt-get update \
-  && sudo npx --yes @playwright/test@${PLAYWRIGHT_VERSION} install-deps chromium \
-  && npx --yes @playwright/test@${PLAYWRIGHT_VERSION} install chromium \
-  && sudo rm -rf /var/lib/apt/lists/* /root/.npm \
-  && rm -rf /home/node/.npm/_npx
+ARG WITH_PLAYWRIGHT=1
+RUN if [ "$WITH_PLAYWRIGHT" = 1 ]; then \
+      sudo apt-get update \
+      && sudo npx --yes @playwright/test@${PLAYWRIGHT_VERSION} install-deps chromium \
+      && npx --yes @playwright/test@${PLAYWRIGHT_VERSION} install chromium \
+      && sudo rm -rf /var/lib/apt/lists/* /root/.npm \
+      && rm -rf /home/node/.npm/_npx; \
+    fi
 
-# Last layer on purpose — it is the one that changes most often. The shell
-# functions feed a concrete version in via --build-arg, so a new release
-# invalidates this layer and nothing above it. That is what lets cbrecreate
+# Last layer on purpose — it is the one that changes most often. cb feeds a
+# concrete version in via --build-arg, so a new release
+# invalidates this layer and nothing above it. That is what lets `cb recreate`
 # pick up a new claude-code without --no-cache.
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# What this image was actually built with, so `docker inspect` can answer it.
+# cb reads this label rather than its own state file: the file only remembers
+# what to build next time and may be lost or hand-edited, while the label
+# travels with the image it describes.
+#
+# Last instruction on purpose — a LABEL is metadata and rebuilding it costs
+# nothing, so it must not sit above the claude-code layer that changes most
+# often.
+ARG WITH_GO
+LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},playwright=${WITH_PLAYWRIGHT},rust=${WITH_RUST},sqlx=${WITH_SQLX}"
