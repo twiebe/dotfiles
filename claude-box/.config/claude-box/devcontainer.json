@@ -44,9 +44,31 @@
     "--hostname", "${localEnv:CB_NAME:claude-box}",
     "--privileged=${localEnv:CB_DIND:false}"
   ],
-  // ~/.claude is ONE volume for every box, so the login (.credentials.json plus
-  // oauthAccount/userID in .claude.json), settings.json and plugins/ are set up
-  // once and then shared.
+  // Docker creates a missing bind source itself, and on a Linux host that
+  // directory lands root-owned, which node then cannot write. Creating it here
+  // means a fresh machine works on either host.
+  "initializeCommand": "mkdir -p ${localEnv:HOME}/.claude",
+
+  // The host's ~/.claude is bind-mounted into every box, so the login
+  // (.credentials.json plus oauthAccount/userID in .claude.json),
+  // settings.json and plugins/ are set up once and then shared. This used to
+  // be a cb-config volume; on the host the same state is greppable,
+  // backup-able and out of reach of `docker volume prune`.
+  //
+  // Ownership takes care of itself: OrbStack's virtiofs presents the mount as
+  // whoever reads it, so the files are node inside the box and the host user
+  // outside. No chown, no uid juggling.
+  //
+  // Nothing on the host may write this directory. plugins/cache/ holds native
+  // binaries built for linux-arm64 and daemon.lock carries container pids, so
+  // a Claude Code running on macOS itself would load both and break. If that
+  // ever starts, give the boxes their own directory rather than sharing this
+  // one.
+  //
+  // virtiofs is slower than a volume for the small constant writes in
+  // projects/ and file-history/. Should that ever show, layer a volume back
+  // over just those paths: Docker applies mounts by path depth, so a nested
+  // mount on top of the bind wins.
   //
   // Everything project-scoped in there is keyed by the workspace path, not by
   // the container: projects/<escaped path>/ holds transcripts and memory,
@@ -56,11 +78,12 @@
   // every box would be the same project and would share its permissions,
   // memory and prompt history.
   //
-  // Shell history stays per repo; make it "cb-history" without the id for one
-  // shared history across boxes.
+  // Shell history stays per repo and stays a volume, being throwaway state
+  // that would only clutter the host; make it "cb-history" without the id for
+  // one shared history across boxes.
   "mounts": [
     "source=cb-history-${devcontainerId},target=/commandhistory,type=volume",
-    "source=cb-config,target=/home/node/.claude,type=volume"
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind,consistency=delegated"
   ],
   "containerEnv": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
