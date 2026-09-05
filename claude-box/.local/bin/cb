@@ -843,8 +843,8 @@ def cmd_rebuild_image(flags, args):
 
     Feature flags are remembered, so a later bare `cb rebuild-image` reproduces
     the same set. --no-cache is the nuclear option: it discards the Rust
-    toolchain, the from-source sqlx-cli build and the Playwright download, which
-    update-claude gets you without.
+    toolchain, the from-source sqlx-cli build and the Playwright apt layer,
+    which update-claude gets you without.
 
     Builds and stops. The image is shared by every box, so touching only the one
     in the current directory would be an arbitrary half-measure — and running

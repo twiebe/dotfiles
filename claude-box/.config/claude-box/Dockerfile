@@ -62,7 +62,7 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 # intended behaviour — use `python3 -m venv` or uv above. python3-pip is here
 # for use *inside* those environments, python3-venv for creating them.
 #
-# Every entry below names the command that breaks without it. The three added
+# Every entry below names the command that breaks without it. The four added
 # most recently:
 #   cmake    `cargo build` in any crate with a CMake-driven -sys dependency.
 #            Not a niche case: audiopus_sys, aws-lc-sys and friends all shell
@@ -75,6 +75,10 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 #            Missing entirely, not merely unlinked.
 #   sqlite3  `sqlite3 <db> '<query>'` — checking SQL semantics by hand against
 #            a dev database, which the app's own binary cannot answer.
+#   time     `/usr/bin/time -v <cmd>` — wall clock, peak RSS and exit status for
+#            a whole command or pipeline. zsh's `time` is a builtin that reports
+#            none of that, so measuring what a build or a test run actually
+#            costs otherwise means timestamping by hand.
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
   ca-certificates \
@@ -97,6 +101,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   python3-venv \
   sqlite3 \
   sudo \
+  time \
   tmux \
   tzdata \
   vim \
@@ -272,38 +277,38 @@ RUN if [ "$WITH_SQLX" = 1 ] && [ "$WITH_RUST" = 1 ]; then \
 # intermediates land here and ship inside the image.
 ENV CARGO_TARGET_DIR=/home/node/.cache/cargo-target
 
-# Playwright's Chromium plus the shared libraries it dlopen()s at startup.
-# Without the libraries `npx playwright install chromium` refuses to run at all,
-# failing inside _validateHostRequirements; without the browser every Playwright
-# test aborts with "Executable doesn't exist at .../chrome-linux/headless_shell".
-# The two steps together cost several minutes on a cold cache, which is the
-# whole reason to bake them in.
+# The shared libraries Chromium dlopen()s at startup — libnss3, the libatk and
+# libgtk set, the fonts — and nothing else. Without them a browser that is
+# installed perfectly well refuses to launch, and the failure reads like a
+# broken test suite rather than a missing package.
 #
-# install-deps is the only half that needs root, since it apt-installs. The
-# download runs as node so the browser lands in /home/node/.cache/ms-playwright,
-# an ordinary image layer — none of the volumes in devcontainer.json cover
-# ~/.cache. Order matters: the host-requirements check runs first.
+# This apt install is the only part of a Playwright setup that needs root,
+# which is the whole reason it is baked in. A project installs its own browser
+# fine as node; `install-deps` is the step that otherwise leaves it reaching
+# for `sudo npx playwright install-deps chromium` by hand.
+#
+# No browser binary here, deliberately. Playwright resolves the browser
+# revision from the @playwright/test version a project has installed, and
+# `playwright install` removes revisions it does not need — so a baked-in
+# browser is ~110 MB that the first project run deletes. Projects download
+# their own, once per revision per machine.
+#
+# @latest rather than a pin for the same reason: the apt package list for
+# chromium barely moves between Playwright releases, and nothing here is
+# supposed to track any project's lockfile.
 #
 # The `apt-get update` is not redundant. install-deps shells out to `apt-get
 # install` without refreshing first, and every apt block above ends by wiping
 # /var/lib/apt/lists — so without this the build dies on "Unable to locate
 # package libnss3" for two dozen packages that trixie does in fact carry.
 #
-# check-images: hold - this pin deliberately does not track any project's
-# lockfile. A project pins @playwright/test in its own package-lock.json and
-# this image is shared by all of them, so the two are independent by
-# construction. The baked browser is a warm cache, not a contract: a project on
-# another version runs `npx playwright install chromium` and gets its own
-# revision beside this one, because the cache directory is node-owned. Bump this
-# on its own schedule.
-ARG PLAYWRIGHT_VERSION=1.62.1
+# Stays this low in the file even though it is now a small layer: a change here
+# must not invalidate the Rust toolchain and the sqlx-cli build above it.
 ARG WITH_PLAYWRIGHT=1
 RUN if [ "$WITH_PLAYWRIGHT" = 1 ]; then \
       sudo apt-get update \
-      && sudo npx --yes @playwright/test@${PLAYWRIGHT_VERSION} install-deps chromium \
-      && npx --yes @playwright/test@${PLAYWRIGHT_VERSION} install chromium \
-      && sudo rm -rf /var/lib/apt/lists/* /root/.npm \
-      && rm -rf /home/node/.npm/_npx; \
+      && sudo npx --yes playwright@latest install-deps chromium \
+      && sudo rm -rf /var/lib/apt/lists/* /root/.npm; \
     fi
 
 # Last layer on purpose — it is the one that changes most often. cb feeds a
