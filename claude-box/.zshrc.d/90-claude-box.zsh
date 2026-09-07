@@ -20,7 +20,7 @@ _cb() {
     'update-claude:rebuild with the newest claude-code, then recreate'
     'config:show or set this box'"'"'s settings'
   )
-  features=(docker go playwright rust sqlx)
+  features=(docker go playwright rust sqlx tofu)
 
   if (( CURRENT == 2 )); then
     _describe -t commands 'cb command' subcommands

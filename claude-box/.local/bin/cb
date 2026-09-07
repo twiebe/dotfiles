@@ -333,7 +333,7 @@ def extract_flags(args):
 # name the devcontainer CLI would choose.
 # ---------------------------------------------------------------------------
 
-IMAGE_FEATURES = ("docker", "go", "playwright", "rust", "sqlx")
+IMAGE_FEATURES = ("docker", "go", "playwright", "rust", "sqlx", "tofu")
 
 # The image carries its own answer as a label, so `docker inspect` stays
 # authoritative even when the state file has been lost or hand-edited. The file
