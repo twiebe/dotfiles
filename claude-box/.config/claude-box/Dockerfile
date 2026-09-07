@@ -1,25 +1,30 @@
 # syntax=docker/dockerfile:1
 
-# uv and Go both come out of their official images rather than an installer
-# script: uv is only packaged from Debian forky/sid onwards, and trixie's Go is
-# 1.24 while upstream is at 1.26 — a gap Go's own toolchain policy does not
-# expect. Each gets a stage of its own because `COPY --from=` does not expand
+# uv, Go and OpenTofu all come out of their official images rather than an
+# installer script: uv is only packaged from Debian forky/sid onwards, trixie's
+# Go is 1.24 while upstream is at 1.26 — a gap Go's own toolchain policy does
+# not expect — and OpenTofu is in no Debian suite at all, which leaves upstream's
+# image as the only source that is neither `curl | sh` nor a release tarball off
+# GitHub. Each gets a stage of its own because `COPY --from=` does not expand
 # variables.
 #
-# Both version ARGs sit here, before the first FROM, because that is the only
+# The version ARGs sit here, before the first FROM, because that is the only
 # place a global ARG exists: the global scope ends at the first FROM, and an ARG
 # after it belongs to that stage alone. Declared further down, GO_VERSION would
 # expand to the empty string and the build would fail with
 # `invalid reference format` on "golang:-trixie".
 #
-# WITH_GO is global for the same reason. Unlike the other toggles it cannot be
-# a shell condition inside a RUN: Go arrives by COPY --from, and an `if` would
-# have to copy the 250 MB in and delete it afterwards, which leaves it in the
-# layer. The stage alias below picks an empty directory instead, so `go` names
-# something either way and the COPY at the bottom needs no knowledge of it.
+# WITH_GO and WITH_TOFU are global for the same reason. Unlike the other toggles
+# they cannot be a shell condition inside a RUN: both toolchains arrive by
+# COPY --from, and an `if` would have to copy the payload in and delete it
+# afterwards, which leaves it in the layer. The stage aliases below pick an
+# empty directory instead, so `go` and `tofu` name something either way and the
+# COPY lines further down need no knowledge of the toggle.
 ARG UV_VERSION=0.12.1
 ARG GO_VERSION=1.26.5
+ARG TOFU_VERSION=1.12.6
 ARG WITH_GO=1
+ARG WITH_TOFU=1
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 FROM golang:${GO_VERSION}-trixie AS go-1
@@ -27,11 +32,24 @@ FROM node:26-trixie-slim AS go-0
 RUN mkdir -p /usr/local/go
 FROM go-${WITH_GO} AS go
 
+# The -minimal tag is what upstream documents for exactly this use: it carries
+# the tofu binary at /usr/local/bin/tofu and nothing else — no shell, so no RUN
+# can happen in it. Hence the extra stage below: the enabled variant is a plain
+# node layer that lifts the binary into a directory of its own, because the
+# alias trick needs both variants to offer the same path and the disabled one
+# has no file to offer.
+FROM ghcr.io/opentofu/opentofu:${TOFU_VERSION}-minimal AS tofu-bin
+FROM node:26-trixie-slim AS tofu-1
+COPY --from=tofu-bin /usr/local/bin/tofu /opt/tofu/tofu
+FROM node:26-trixie-slim AS tofu-0
+RUN mkdir -p /opt/tofu
+FROM tofu-${WITH_TOFU} AS tofu
+
 # Debian trixie rather than Alpine: projects get built inside this container,
 # and musl costs more there than Alpine's fresher packages gain. Every tool
 # comes from the distro repos — no `wget | sh`, no GitHub release downloads.
-# The only exceptions are claude-code (npm, the whole point of the box) plus uv
-# and Go, both copied out of official images (see above).
+# The only exceptions are claude-code (npm, the whole point of the box) plus uv,
+# Go and OpenTofu, all copied out of official images (see above).
 FROM node:26-trixie-slim
 
 # Build-time knobs default here, not in devcontainer.json: this Dockerfile is
@@ -311,6 +329,21 @@ RUN if [ "$WITH_PLAYWRIGHT" = 1 ]; then \
       && sudo rm -rf /var/lib/apt/lists/* /root/.npm; \
     fi
 
+# OpenTofu, for a checkout whose infrastructure is code: `tofu init`,
+# `tofu plan` and `tofu apply` against its .tf files. Not in Debian, so it comes
+# out of upstream's -minimal image via the stages at the top of this file.
+#
+# A directory rather than the bare binary into /usr/local/bin, and an ENV to
+# reach it: that is the same shape as Go above, and it is what makes
+# --without-tofu a no-op instead of a build failure — the disabled stage hands
+# over an empty directory, and copying one costs nothing. The PATH entry then
+# names a directory that exists but is empty, exactly as /usr/local/go does.
+#
+# ~100 MB of static Go binary, so it sits below the layers above it that are
+# expensive to redo, and a TOFU_VERSION bump invalidates this layer alone.
+COPY --from=tofu /opt/tofu /opt/tofu
+ENV PATH=/opt/tofu:$PATH
+
 # Last layer on purpose — it is the one that changes most often. cb feeds a
 # concrete version in via --build-arg, so a new release
 # invalidates this layer and nothing above it. That is what lets `cb recreate`
@@ -327,4 +360,5 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # nothing, so it must not sit above the claude-code layer that changes most
 # often.
 ARG WITH_GO
-LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},playwright=${WITH_PLAYWRIGHT},rust=${WITH_RUST},sqlx=${WITH_SQLX}"
+ARG WITH_TOFU
+LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},playwright=${WITH_PLAYWRIGHT},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
