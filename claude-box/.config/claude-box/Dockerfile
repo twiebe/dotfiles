@@ -52,10 +52,9 @@ FROM tofu-${WITH_TOFU} AS tofu
 # Go and OpenTofu, all copied out of official images (see above).
 FROM node:26-trixie-slim
 
-# Build-time knobs default here, not in devcontainer.json: this Dockerfile is
-# built directly (`docker build`) so that the image gets one fixed name instead
-# of the per-workspace name the devcontainer CLI would pick. `docker build` in
-# this directory therefore has to produce the intended image without arguments.
+# Build-time knobs default to the full image: cb passes a --build-arg per
+# feature, but `docker build` in this directory has to produce the intended
+# image on its own, without that list in front of it.
 ARG TZ=Europe/Berlin
 ENV TZ="$TZ"
 
@@ -65,12 +64,14 @@ ENV TZ="$TZ"
 # `locales` and generate the locale during the build.
 ENV LANG=C.UTF-8
 
+# Not read by cb — kept because tools probe it to tell a throwaway container
+# apart from a workstation, Claude Code among them.
 ENV DEVCONTAINER=true
 ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 
 # Base image scope: what Claude Code needs plus what building code needs.
 # Anything that is per-project or personal taste (starship, direnv, language
-# toolchains beyond the ones below) belongs in a project's own .devcontainer/.
+# toolchains beyond the ones below) belongs in the project, not here.
 # trixie versions as of this commit:
 #   git-delta 0.18.2  fzf 0.60.3  gh 2.46.0  python3 3.13
 #   cmake 3.31.6  curl 8.14.1  sqlite3 3.46.1
@@ -203,8 +204,9 @@ ARG USERNAME=node
 # sudo used to be a no-op: no sudoers entry, and node has no password.
 # Either do it properly or leave the package out.
 #
-# The env_keep line exists for cb-dockerd: postStartCommand reaches it through
-# sudo, and sudo drops the environment it would otherwise read CB_DIND from.
+# The env_keep line is for reaching cb-dockerd by hand: sudo drops the
+# environment it would otherwise read CB_DIND from. cb itself runs it as root
+# through `docker exec`, where the container's own environment carries CB_DIND.
 RUN printf 'Defaults env_keep += "CB_DIND"\n%s ALL=(ALL) NOPASSWD:ALL\n' "$USERNAME" > /etc/sudoers.d/$USERNAME \
   && chmod 0440 /etc/sudoers.d/$USERNAME
 
@@ -283,11 +285,11 @@ RUN if [ "$WITH_SQLX" = 1 ] && [ "$WITH_RUST" = 1 ]; then \
 # /workspaces/<project> is a bind mount of the host checkout, which on macOS is
 # virtiofs. Building there is slow and, worse, corrupts .rlibs. An ENV rather
 # than a line in /etc/zsh/zshrc so it reaches every process — a non-interactive
-# `cbexec cargo test`, a build an editor spawns, a hook — and not only
+# `cb exec cargo test`, a build an editor spawns, a hook — and not only
 # interactive shells.
 #
 # One directory per box rather than per project, which is what a box already is:
-# workspaceFolder in devcontainer.json is unique per repo, so a box holds one
+# the workspace path cb mounts at is unique per repo, so a box holds one
 # checkout. Not a volume, deliberately: this is rebuildable state, and
 # `cb recreate` is supposed to hand back a clean slate.
 #
