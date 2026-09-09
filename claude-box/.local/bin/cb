@@ -11,11 +11,8 @@ import sys
 import urllib.request
 
 CB_DIR = os.path.expanduser("~/.config/claude-box")
-CB_CONFIG = os.path.join(CB_DIR, "devcontainer.json")
 
-# Must match the "image" field in CB_CONFIG. One tag for every box: the
-# Dockerfile is built here rather than by the devcontainer CLI, which would
-# derive a vsc-<folder>-<hash> name and give each repo an image of its own.
+# One tag for every box. The Dockerfile in CB_DIR produces it.
 CB_IMAGE = "claude-box:latest"
 
 CLAUDE_PACKAGE = "@anthropic-ai/claude-code"
@@ -38,7 +35,7 @@ class UsageError(CbError):
 
 
 class MissingBinary(CbError):
-    """docker or devcontainer is not on PATH."""
+    """docker is not on PATH."""
 
     code = 127
 
@@ -118,9 +115,9 @@ def container_name(path):
 # repeated on every invocation. Flag beats file beats default, and the flag
 # that wins is also written back, so `cb --docker` once is permanent.
 #
-# The store lives under XDG_STATE_HOME and not next to devcontainer.json,
-# because that directory is stowed: stow folds a directory it alone owns into a
-# single symlink, so writing there would write into the dotfiles checkout.
+# The store lives under XDG_STATE_HOME and not next to the Dockerfile, because
+# that directory is stowed: stow folds a directory it alone owns into a single
+# symlink, so writing there would write into the dotfiles checkout.
 # ---------------------------------------------------------------------------
 
 SETTINGS_VERSION = 1
@@ -328,9 +325,8 @@ def extract_flags(args):
 # nothing to resolve and cannot leave two boxes fighting over a tag.
 #
 # All default to on, which is what keeps a bare `docker build` in
-# .config/claude-box producing the intended image — the Dockerfile is built
-# directly so that the result gets one fixed name rather than the per-workspace
-# name the devcontainer CLI would choose.
+# .config/claude-box producing the same image cb builds — the Dockerfile has to
+# stand on its own, without cb's --build-arg list in front of it.
 # ---------------------------------------------------------------------------
 
 IMAGE_FEATURES = ("docker", "go", "playwright", "rust", "sqlx", "tofu")
@@ -451,7 +447,7 @@ def in_roots(path, allowed):
 # ---------------------------------------------------------------------------
 
 
-def run(argv, env=None, quiet=False, check=True):
+def run(argv, quiet=False, check=True):
     """Run `argv`, inheriting the terminal unless `quiet`."""
     if DRY_RUN:
         print("+ " + shlex.join(argv))
@@ -459,7 +455,6 @@ def run(argv, env=None, quiet=False, check=True):
     try:
         completed = subprocess.run(
             argv,
-            env=env,
             stdout=subprocess.DEVNULL if quiet else None,
         )
     except FileNotFoundError:
@@ -509,16 +504,36 @@ def confirm(question, assume_yes):
 # ---------------------------------------------------------------------------
 # Docker
 #
-# Boxes are found by the labels the devcontainer CLI stamps on them — the host
-# folder it was launched from, and the config that produced it — rather than by
-# name. The name carries a hash and says less.
+# Boxes are found by the labels cb stamps on them — one saying this is a box at
+# all, one naming the host folder it was launched from — rather than by name.
+# The name carries a hash and says less.
 # ---------------------------------------------------------------------------
 
-FOLDER_LABEL = "devcontainer.local_folder"
-CONFIG_LABEL = "devcontainer.config_file"
+BOX_LABEL = "cb.box"
+FOLDER_LABEL = "cb.folder"
 
-# `-a` rather than plain `ps`: a stopped box is still a box.
-PS_TABLE = 'table {{.Names}}\t{{.Status}}\t{{.Label "devcontainer.local_folder"}}'
+# What the devcontainer CLI stamps: the folder it was launched from, and the
+# config that produced it. cb used to go through that CLI, so a box made before
+# the switch carries these instead of the two above and would otherwise be
+# invisible — and then collide with its replacement on the container name.
+#
+# The folder label alone is not enough to recognise one. VS Code stamps it with
+# the same value for a repo's own .devcontainer/, so matching on it would let cb
+# adopt a container it did not make: `cb` would exec claude in a box that has
+# none, and `cb recreate` would remove it. The config label is what tells cb's
+# own leftovers apart, and the two are asked together.
+DC_FOLDER_LABEL = "devcontainer.local_folder"
+LEGACY_CONFIG_LABEL = "devcontainer.config_file"
+LEGACY_CONFIG = os.path.join(CB_DIR, "devcontainer.json")
+
+# `-a` rather than plain `ps`: a stopped box is still a box. The folder is asked
+# for under both labels because one listing covers both kinds of container.
+PS_FORMAT = '{{.Names}}\t{{.Status}}\t{{.Label "%s"}}\t{{.Label "%s"}}' % (
+    FOLDER_LABEL,
+    DC_FOLDER_LABEL,
+)
+
+TABLE_HEADER = ("NAME", "STATUS", "FOLDER")
 
 
 def label_filter(label, value=None):
@@ -526,24 +541,96 @@ def label_filter(label, value=None):
     return ["--filter", "label=" + term]
 
 
-def docker_names(filters):
-    out = capture(["docker", "ps", "-a", "--format", "{{.Names}}"] + filters)
-    if out is None:
-        raise CbError("docker is not answering — is the daemon running?")
-    return [line for line in out.splitlines() if line]
+def legacy_filters(workspace=None):
+    """Boxes left behind by the devcontainer version of cb, and nothing else.
+
+    Several --filter terms in one query are an AND, so adding the config label is
+    what keeps a foreign devcontainer for the same folder out.
+    """
+    filters = label_filter(LEGACY_CONFIG_LABEL, LEGACY_CONFIG)
+    if workspace is not None:
+        filters += label_filter(DC_FOLDER_LABEL, workspace)
+    return filters
 
 
-def docker_table(filters):
-    out = capture(["docker", "ps", "-a", "--format", PS_TABLE] + filters)
-    if out is None:
-        raise CbError("docker is not answering — is the daemon running?")
-    return out.rstrip("\n")
+def merge_rows(row_lists):
+    """One row per container, first answer wins.
+
+    `--any` asks two questions that overlap: a box made by the devcontainer
+    version of cb answers the devcontainer one, and would answer cb's too if it
+    were ever relabelled in place. Listing a container twice reads as two boxes
+    and removing it twice is an error, so the overlap is collapsed here rather
+    than guarded against at each call site.
+    """
+    merged = {}
+    for rows in row_lists:
+        for row in rows:
+            merged.setdefault(row[0], row)
+    return list(merged.values())
+
+
+def parse_ps_rows(out):
+    """(name, status, folder) per line of PS_FORMAT output.
+
+    The two folder columns are one answer: a container has cb's label or the
+    devcontainer CLI's, never both, and a listing wants one column either way.
+    """
+    rows = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        fields = (line.split("\t") + ["", "", ""])[:4]
+        name, status, folder, dc_folder = fields
+        rows.append((name, status, folder or dc_folder or "-"))
+    return rows
+
+
+def format_table(rows):
+    """Render `rows` under TABLE_HEADER, columns padded to the widest cell.
+
+    Built here rather than by `docker ps --format table …` because the folder is
+    two labels and a Go template would have to show both as columns of their
+    own, one of them always empty.
+    """
+    cells = [TABLE_HEADER] + [tuple(row) for row in rows]
+    widths = [max(len(row[i]) for row in cells) for i in range(len(TABLE_HEADER))]
+    lines = [
+        "  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip()
+        for row in cells
+    ]
+    return "\n".join(lines)
+
+
+def docker_rows(filtersets):
+    """(name, status, folder) for the union of several label queries."""
+    answers = []
+    for filters in filtersets:
+        out = capture(["docker", "ps", "-a", "--format", PS_FORMAT] + filters)
+        if out is None:
+            raise CbError("docker is not answering — is the daemon running?")
+        answers.append(parse_ps_rows(out))
+    return merge_rows(answers)
+
+
+def docker_names(filtersets):
+    return [row[0] for row in docker_rows(filtersets)]
+
+
+def docker_table(filtersets):
+    return format_table(docker_rows(filtersets))
+
+
+# The two scopes shared by ls and down. A box is cb's own whichever version made
+# it, so both carry; `--any` widens that to every devcontainer on the machine,
+# which is why it asks before removing anything.
+BOX_SCOPE = [label_filter(BOX_LABEL), legacy_filters()]
+ANY_SCOPE = [label_filter(BOX_LABEL), label_filter(DC_FOLDER_LABEL)]
 
 
 def docker_remove(names):
     """Remove containers by name, and say which.
 
-    Never -v: cb-history-<id> holds the shell history and a teardown must not
+    Never -v: cb-history-<hash> holds the shell history and a teardown must not
     take it along. The Claude config is a bind mount of the host's ~/.claude and
     is out of reach of -v either way, so only container state is lost.
     """
@@ -552,9 +639,23 @@ def docker_remove(names):
         print("removed: " + " ".join(names))
 
 
+def box_filters(workspace):
+    """Every way a box for `workspace` can be labelled.
+
+    Two generations: cb's own label, and the pair that identifies a leftover from
+    the devcontainer version. Nothing else qualifies — see legacy_filters.
+    """
+    return [label_filter(FOLDER_LABEL, workspace), legacy_filters(workspace)]
+
+
 def box_for(workspace):
-    """The container started from `workspace`, if there is one."""
-    names = docker_names(label_filter(FOLDER_LABEL, workspace))
+    """The container started from `workspace`, if there is one.
+
+    Asked of both generations of label, so a box created by the devcontainer
+    version of cb is found by the current one instead of colliding with it on the
+    name.
+    """
+    names = docker_names(box_filters(workspace))
     return names[0] if names else None
 
 
@@ -642,54 +743,254 @@ def ensure_image():
 
 
 # ---------------------------------------------------------------------------
-# The devcontainer CLI
+# The container
 #
-# Every call has to agree on the config, because the CLI finds an existing
-# container by labels that include the config path. Mixing them would start a
-# second container for the same folder.
+# This is what devcontainer.json used to hold, said in docker's own flags. The
+# CLI bought a create-or-start decision and a labelled container, and cost a
+# node process per invocation plus a config format whose only way to reach a
+# per-box value was ${localEnv:…} — every one of CB_NAME, CB_PROJECT and CB_DIND
+# was smuggled through the environment because the CLI offers no variable that
+# is both sanitized and unique.
 #
-# CB_PROJECT and CB_NAME reach devcontainer.json through ${localEnv:…}. They
-# live here rather than in the JSON because the only variable the CLI offers,
-# ${localWorkspaceFolderBasename}, is neither sanitized nor unique.
+# Two things the CLI did are deliberately not reproduced. Its customizations
+# listed a VS Code extension and a terminal profile, which only an editor
+# opening the folder ever read, and a box is driven from a terminal. And
+# updateRemoteUserUID, on by default, rebuilt the image to remap node's uid onto
+# the host user's — unnecessary on OrbStack, whose virtiofs presents a mount as
+# whoever reads it, and a no-op anyway wherever the host user is uid 1000 like
+# the image's node. On a Linux host with a different uid, files cb writes into
+# the checkout would land owned by 1000; add --user "$(id -u):$(id -g)" here if
+# that ever bites, and expect to fix up /home/node at the same time.
 # ---------------------------------------------------------------------------
 
+BOX_USER = "node"
+WORKSPACES = "/workspaces"
 
-def dc_env(workspace, docker):
-    env = dict(os.environ)
-    env["CB_PROJECT"] = slug(os.path.basename(workspace))
-    env["CB_NAME"] = container_name(workspace)
-    env["CB_DIND"] = "true" if docker else "false"
+# The host's ~/.claude is bind-mounted into every box, so the login
+# (.credentials.json plus oauthAccount/userID in .claude.json), settings.json
+# and plugins/ are set up once and then shared. On the host that state is
+# greppable, backup-able and out of reach of `docker volume prune`.
+#
+# Ownership takes care of itself: OrbStack's virtiofs presents the mount as
+# whoever reads it, so the files are node inside the box and the host user
+# outside. No chown, no uid juggling.
+#
+# Nothing on the host may write this directory. plugins/cache/ holds native
+# binaries built for linux-arm64 and daemon.lock carries container pids, so a
+# Claude Code running on macOS itself would load both and break. If that ever
+# starts, give the boxes their own directory rather than sharing this one.
+HOST_CLAUDE_DIR = os.path.expanduser("~/.claude")
+BOX_CLAUDE_DIR = "/home/{}/.claude".format(BOX_USER)
+
+CB_DOCKERD = "/usr/local/bin/cb-dockerd"
+
+# Host variables worth having inside the box: both are how a terminal announces
+# itself, and Claude Code reads them to decide what it may draw.
+PASSTHROUGH_ENV = ("TERM_PROGRAM", "LC_TERMINAL")
+
+# Nothing in the image stays in the foreground. --init puts tini at pid 1, which
+# reaps what claude and a dind daemon leave behind and answers `docker stop`
+# without waiting out the kill timeout.
+IDLE_COMMAND = ["sleep", "infinity"]
+
+
+def workspace_folder(workspace):
+    """Where the checkout is mounted inside the box.
+
+    Unique per repo, because everything Claude keys by project is keyed by this
+    path: projects/<escaped path>/ holds transcripts and memory, .claude.json
+    has a "projects" section per path (allowedTools, mcpServers, trust), and
+    history.jsonl tags each prompt with its project. With a fixed /workspace
+    every box would be the same project and would share all of it.
+
+    Deliberately carries no hash — it shows up in the prompt and in every path
+    Claude prints, so it stays readable. Two repos whose directory name is
+    identical therefore do share one project identity; rename one of them if
+    that matters.
+    """
+    return "{}/{}".format(WORKSPACES, slug(os.path.basename(workspace)))
+
+
+def history_volume(workspace):
+    """Shell history stays per repo and stays a volume, being throwaway state
+    that would only clutter the host. Drop the hash for one shared history.
+
+    The devcontainer version of cb named these after ${devcontainerId}, a digest
+    of its own. Those volumes are orphaned rather than migrated — this is
+    throwaway state, and `docker volume ls | grep cb-history-` finds them for
+    anyone who wants the disk back.
+    """
+    return "cb-history-" + path_hash(workspace)
+
+
+def container_env(docker):
+    """The environment baked into a box at creation time.
+
+    CB_DIND is captured here on purpose: the container keeps the answer, so a
+    later plain `cb` brings the box back up with its daemon and does not have to
+    repeat the flag.
+    """
+    env = {
+        "CB_DIND": "true" if docker else "false",
+        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+        "CLAUDE_CONFIG_DIR": BOX_CLAUDE_DIR,
+        "NODE_OPTIONS": "--max-old-space-size=4096",
+    }
+    for name in PASSTHROUGH_ENV:
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
     return env
 
 
-def dc_up(workspace, docker, recreate=False, quiet=False, extra=()):
-    argv = ["devcontainer", "up", "--workspace-folder", workspace, "--config", CB_CONFIG]
-    if recreate:
-        argv.append("--remove-existing-container")
-    argv += list(extra)
-    run(argv, env=dc_env(workspace, docker), quiet=quiet)
+def create_argv(workspace, docker):
+    """The whole of a box's shape, as one `docker run`.
+
+    --mount rather than -v: it names its parts, and it refuses to invent a
+    missing bind source instead of creating it root-owned.
+
+    --privileged is what lets dockerd inside the box mount, write cgroups and
+    program iptables, so only a box that asked for docker gets those rights.
+    It applies at creation time only — reconcile() is what notices later.
+    """
+    # docker parses a --mount value as CSV, so a comma in the path would split
+    # the field and the flag would be rejected with something unrelated to the
+    # cause. Said here rather than worked around: a quoted field would work but
+    # nothing in this repo can exercise it.
+    if "," in workspace:
+        raise UsageError(
+            "cannot mount {}: docker reads a comma in a --mount path as the end "
+            "of the field\nrename the directory".format(workspace)
+        )
+
+    name = container_name(workspace)
+    folder = workspace_folder(workspace)
+
+    argv = [
+        "docker",
+        "run",
+        "--detach",
+        "--init",
+        "--name",
+        name,
+        # Without this the prompt inside the box shows a random hex id.
+        "--hostname",
+        name,
+        "--label",
+        "{}=1".format(BOX_LABEL),
+        "--label",
+        "{}={}".format(FOLDER_LABEL, workspace),
+        "--workdir",
+        folder,
+    ]
+    if docker:
+        argv.append("--privileged")
+
+    for source, target in (
+        (workspace, folder),
+        (HOST_CLAUDE_DIR, BOX_CLAUDE_DIR),
+    ):
+        argv += ["--mount", "type=bind,source={},target={}".format(source, target)]
+    argv += [
+        "--mount",
+        "type=volume,source={},target=/commandhistory".format(history_volume(workspace)),
+    ]
+
+    for key, value in container_env(docker).items():
+        argv += ["--env", "{}={}".format(key, value)]
+
+    return argv + [CB_IMAGE] + IDLE_COMMAND
 
 
-def dc_exec(workspace, docker, command):
+def exec_argv(name, command, tty=None, user=None, interactive=True):
+    """Run `command` inside the box called `name`.
+
+    The tty is asked for rather than assumed: `docker exec --tty` fails outright
+    with "the input device is not a TTY" wherever there is none, which is the
+    normal case for a hook or a script.
+
+    TERM is forwarded with the tty, because docker otherwise hands the command a
+    bare TERM=xterm, which costs tmux and vim inside the box their colours.
+    """
+    if tty is None:
+        tty = sys.stdin.isatty() and sys.stdout.isatty()
+
+    argv = ["docker", "exec"]
+    if interactive:
+        argv.append("--interactive")
+    if tty:
+        argv.append("--tty")
+        if os.environ.get("TERM"):
+            argv += ["--env", "TERM=" + os.environ["TERM"]]
+    if user:
+        argv += ["--user", user]
+
+    # Everything after the container name is the command: docker stops reading
+    # flags there, so `cb exec docker ps --all` needs no `--`.
+    return argv + [name] + list(command)
+
+
+def post_start_argv(name):
+    """cb-dockerd, on every start of the container.
+
+    A no-op unless the box was created with CB_DIND=true, so the boxes without
+    docker pay a process spawn and nothing else. As root because it starts a
+    daemon; it reads CB_DIND out of the container's own environment.
+    """
+    return exec_argv(name, [CB_DOCKERD], tty=False, user="root", interactive=False)
+
+
+def start_box(workspace, docker, box, recreate=False):
+    """Make sure a box for `workspace` is running, and hand back its name.
+
+    Create, start, post-start: the three cases the devcontainer CLI used to
+    decide between. `docker start` on a running container is a no-op, and
+    cb-dockerd returns early when a daemon is already serving, so a plain `cb`
+    against a running box changes nothing.
+
+    `box` is whatever box_for() answered — passed in rather than looked up again,
+    because every caller has already had to ask in order to gate the directory.
+    """
+    if box and recreate:
+        docker_remove([box])
+        box = None
+
+    if box is None:
+        ensure_claude_dir()
+        run(create_argv(workspace, docker), quiet=True)
+    else:
+        run(["docker", "start", box], quiet=True)
+
+    name = box or container_name(workspace)
+
+    # check=False: cb-dockerd exits 1 when dockerd fails every storage driver,
+    # and it has already said why on stderr. A box whose daemon did not come up
+    # still runs claude, so that must not be the thing that ends `cb up`.
+    run(post_start_argv(name), quiet=True, check=False)
+    return name
+
+
+def ensure_claude_dir():
+    """Docker refuses to bind a source that does not exist, and a first run on a
+    fresh machine has no ~/.claude yet."""
+    if DRY_RUN:
+        print("+ mkdir -p " + HOST_CLAUDE_DIR)
+        return
+    os.makedirs(HOST_CLAUDE_DIR, exist_ok=True)
+
+
+def hand_over(name, command):
     """Hand the terminal to a command inside the box, and do not come back.
 
-    execvpe rather than a subprocess: the exit code, the signals and the TTY all
+    execvp rather than a subprocess: the exit code, the signals and the TTY all
     belong to claude, and cb has nothing left to do once it has started.
     """
-    argv = [
-        "devcontainer",
-        "exec",
-        "--workspace-folder",
-        workspace,
-        "--config",
-        CB_CONFIG,
-        "--",
-    ] + list(command)
+    argv = exec_argv(name, command)
     if DRY_RUN:
         print("+ " + shlex.join(argv))
         return
     try:
-        os.execvpe(argv[0], argv, dc_env(workspace, docker))
+        os.execvp(argv[0], argv)
     except FileNotFoundError:
         raise MissingBinary(argv[0])
 
@@ -794,11 +1095,13 @@ def cmd_up(flags, claude_args):
     check_docker_feature(docker)
 
     recreate = box is not None and reconcile(workspace, box, docker, flags["yes"])
-    attach = not flags["no_attach"]
-    dc_up(workspace, docker, recreate=recreate, quiet=attach)
+    name = start_box(workspace, docker, box, recreate=recreate)
 
-    if attach:
-        dc_exec(workspace, docker, ["claude"] + claude_args)
+    if flags["no_attach"]:
+        if not DRY_RUN:
+            print("started " + name)
+        return 0
+    hand_over(name, ["claude"] + claude_args)
     return 0
 
 
@@ -808,12 +1111,15 @@ def cmd_recreate(flags, args):
     settings, overrides = box_settings(workspace, flags)
     docker = settings["docker"][0]
 
-    if box_for(workspace) is None:
+    box = box_for(workspace)
+    if box is None:
         check_gate(workspace, settings["force"][0])
     remember(workspace, overrides)
     ensure_image()
     check_docker_feature(docker)
-    dc_up(workspace, docker, recreate=True)
+    name = start_box(workspace, docker, box, recreate=True)
+    if not DRY_RUN:
+        print("started " + name)
     return 0
 
 
@@ -874,14 +1180,14 @@ def cmd_down(flags, args):
         return down_any(flags["yes"])
 
     if scope == "all":
-        filters = label_filter(CONFIG_LABEL, CB_CONFIG)
+        names = docker_names(BOX_SCOPE)
         missing = "no claude box found"
     else:
         workspace = current_workspace()
-        filters = label_filter(FOLDER_LABEL, workspace)
+        box = box_for(workspace)
+        names = [box] if box else []
         missing = "no claude box for " + workspace
 
-    names = docker_names(filters)
     if not names:
         raise CbError(missing)
     docker_remove(names)
@@ -891,16 +1197,17 @@ def cmd_down(flags, args):
 def down_any(assume_yes):
     """Every devcontainer on the machine, whatever started it.
 
-    The label is queried for existence only, so VS Code's containers and other
-    projects' `devcontainer up` are in scope too — hence the listing and the
-    prompt before anything happens.
+    The devcontainer label is queried for existence only, so VS Code's
+    containers and other projects' `devcontainer up` are in scope too — hence
+    the listing and the prompt before anything happens.
     """
-    names = docker_names(label_filter(FOLDER_LABEL))
-    if not names:
+    rows = docker_rows(ANY_SCOPE)
+    if not rows:
         raise CbError("no devcontainer found")
-    print(docker_table(label_filter(FOLDER_LABEL)))
+    print(format_table(rows))
     print()
-    if not confirm("remove {} devcontainer(s)?".format(len(names)), assume_yes):
+    names = [row[0] for row in rows]
+    if not confirm("remove {} container(s)?".format(len(names)), assume_yes):
         raise CbError("aborted")
     docker_remove(names)
     return 0
@@ -908,10 +1215,7 @@ def down_any(assume_yes):
 
 def cmd_ls(flags, args):
     scope = scope_of("ls", args, allow_all=False)
-    if scope == "any":
-        print(docker_table(label_filter(FOLDER_LABEL)))
-    else:
-        print(docker_table(label_filter(CONFIG_LABEL, CB_CONFIG)))
+    print(docker_table(ANY_SCOPE if scope == "any" else BOX_SCOPE))
     return 0
 
 
@@ -919,8 +1223,10 @@ def cmd_exec(args):
     if not args:
         raise UsageError("cb exec needs a command")
     workspace = current_workspace()
-    settings = resolve_settings(load_settings(settings_path(workspace)), {})
-    dc_exec(workspace, settings["docker"][0], args)
+    box = box_for(workspace)
+    if box is None:
+        raise CbError("no claude box for " + workspace)
+    hand_over(box, args)
     return 0
 
 
@@ -1013,8 +1319,9 @@ USAGE = """usage: cb [command] [options]
   cb up --no-attach        start the box and stop there
   cb shell                 zsh inside the box
   cb exec CMD…             run CMD inside the box
-  cb down [--all|--any]    remove this box, every cb box, or every devcontainer
-  cb ls [--any]            list cb boxes, or every devcontainer
+  cb down [--all|--any]    remove this box, every cb box, or those plus every
+                           devcontainer on the machine
+  cb ls [--any]            list cb boxes, or those plus every devcontainer
   cb recreate              replace the container, keeping the image
   cb update-claude         rebuild with the newest claude-code, then recreate
   cb rebuild-image [--no-cache] [--with-X|--without-X]…

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Starts a Docker daemon inside a claude box. Run as root by the
-# postStartCommand in devcontainer.json, on every start of the container.
+# Starts a Docker daemon inside a claude box. Run as root by cb, through
+# `docker exec`, on every start of the container.
 #
 # The daemon runs in the box instead of the box talking to the host daemon
 # through a mounted socket: with a mounted socket every path in `docker run -v`
@@ -13,14 +13,15 @@ SOCKET_TIMEOUT=30
 
 # Only a box started with CB_DIND=true is privileged, and without those
 # capabilities dockerd cannot mount, write cgroups or program iptables — it
-# would just leave an error in the log of every other box. devcontainer.json
-# feeds this value into containerEnv as well as into --privileged, so the
-# container keeps its answer for later starts, whatever the restarting shell
-# has set. sudo passes it through via an env_keep line in /etc/sudoers.d.
+# would just leave an error in the log of every other box. cb bakes this value
+# into the container's environment as well as deciding --privileged from it, so
+# the container keeps its answer for later starts, whatever the restarting
+# shell has set. Reached by hand with sudo, it survives via an env_keep line in
+# /etc/sudoers.d.
 [ "${CB_DIND:-false}" = true ] || exit 0
 
-# `devcontainer up` against an already running box runs postStartCommand again.
-# A daemon serving the current session has to survive that, so this returns
+# cb runs this on every start, including against an already running box. A
+# daemon serving the current session has to survive that, so this returns
 # before the wipe below ever happens.
 if pgrep -x dockerd >/dev/null 2>&1; then
   exit 0
@@ -46,8 +47,8 @@ reset_state() {
 # The outer daemon hands out 172.17.0.0/16 as well, and a box whose networks
 # overlap the host's loses the traffic between the two.
 #
-# setsid detaches dockerd from the exec session that postStartCommand runs in;
-# that session ends the moment this script returns.
+# setsid detaches dockerd from the `docker exec` session this script runs in;
+# that session ends the moment it returns.
 start_dockerd() {
   reset_state
   setsid dockerd \

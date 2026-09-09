@@ -4,6 +4,12 @@ Replace the zsh function layer in `claude-box/.zshrc.d/90-claude-box.zsh` with a
 single-file Python CLI named `cb`, and make the image's language toolchains
 optional at build time.
 
+> **Since superseded in one respect (2026-09-09):** cb no longer shells out to
+> the devcontainer CLI, and `devcontainer.json` is gone. `docker run` /
+> `docker start` / `docker exec` do the same work directly, with the container's
+> shape spelled in cb's own flags. Everything below still describes cb except
+> where it names that CLI or that file.
+
 ## Why
 
 The zsh layer has outgrown its shape. Five commands now repeat the same prologue:
