@@ -447,14 +447,25 @@ def in_roots(path, allowed):
 # ---------------------------------------------------------------------------
 
 
-def run(argv, quiet=False, check=True):
-    """Run `argv`, inheriting the terminal unless `quiet`."""
+def run(argv, env=None, quiet=False, check=True):
+    """Run `argv`, inheriting the terminal unless `quiet`.
+
+    `env` replaces the whole environment, so a caller passing one starts from
+    os.environ. What it adds is spelled out by --dry-run, which would otherwise
+    print a command that behaves differently when pasted.
+    """
     if DRY_RUN:
-        print("+ " + shlex.join(argv))
+        added = "".join(
+            "{}={} ".format(key, shlex.quote(value))
+            for key, value in sorted((env or {}).items())
+            if os.environ.get(key) != value
+        )
+        print("+ " + added + shlex.join(argv))
         return 0
     try:
         completed = subprocess.run(
             argv,
+            env=env,
             stdout=subprocess.DEVNULL if quiet else None,
         )
     except FileNotFoundError:
@@ -885,6 +896,25 @@ def image_versions():
     return {} if label is None else parse_version_label(label)
 
 
+def build_env():
+    """The environment `docker build` runs in.
+
+    BuildKit is not optional for this Dockerfile: it opens with a `# syntax`
+    directive and uses COPY --chmod, and the classic builder ignores the first
+    and rejects the second — at a COPY near the end, so the refusal arrives
+    after the Rust toolchain, the from-source sqlx-cli build and the Playwright
+    layer have been redone for nothing.
+
+    Docker already picks BuildKit wherever the buildx component is installed, so
+    this only decides anything where the build could not have succeeded anyway:
+    a DOCKER_BUILDKIT=0 exported for some other project, or a CLI without buildx.
+    Both now say so before the first layer instead of twenty minutes in.
+    """
+    env = dict(os.environ)
+    env["DOCKER_BUILDKIT"] = "1"
+    return env
+
+
 def build_image(features, versions, no_cache=False):
     argv = ["docker", "build"]
     if no_cache:
@@ -893,7 +923,7 @@ def build_image(features, versions, no_cache=False):
     for assignment in feature_build_args(features) + version_build_args(versions):
         argv += ["--build-arg", assignment]
     argv += ["--tag", CB_IMAGE, CB_DIR]
-    run(argv)
+    run(argv, env=build_env())
 
 
 def ensure_image():
