@@ -439,6 +439,28 @@ class ParseVersionTest(unittest.TestCase):
             self.assertIsNone(parse(junk))
 
 
+class BuildEnvTest(unittest.TestCase):
+    """The Dockerfile cannot be built by the classic builder, and the failure it
+    gets there lands at a COPY near the end — after the Rust toolchain, the
+    sqlx-cli build and the Playwright layer."""
+
+    def test_asks_for_buildkit(self):
+        self.assertEqual(cb.build_env()["DOCKER_BUILDKIT"], "1")
+
+    def test_overrides_an_explicit_refusal(self):
+        # A DOCKER_BUILDKIT=0 exported for some other project would otherwise
+        # buy a twenty-minute build that was never going to work.
+        self.addCleanup(os.environ.pop, "DOCKER_BUILDKIT", None)
+        os.environ["DOCKER_BUILDKIT"] = "0"
+        self.assertEqual(cb.build_env()["DOCKER_BUILDKIT"], "1")
+
+    def test_keeps_the_rest_of_the_environment(self):
+        # docker needs PATH, HOME and DOCKER_HOST like any other command.
+        self.addCleanup(os.environ.pop, "CB_TEST_MARKER", None)
+        os.environ["CB_TEST_MARKER"] = "kept"
+        self.assertEqual(cb.build_env()["CB_TEST_MARKER"], "kept")
+
+
 class VersionLabelTest(unittest.TestCase):
     """The image records what it was built with, so `cb config` can answer "what
     uv is in the box" without running it — and still answer after the state file
