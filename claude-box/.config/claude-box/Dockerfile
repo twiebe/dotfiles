@@ -175,8 +175,6 @@ RUN if [ "$WITH_DOCKER" = 1 ]; then \
       && rm -rf /var/lib/apt/lists/*; \
     fi
 
-COPY --chmod=0755 cb-dockerd /usr/local/bin/cb-dockerd
-
 # Replaces zsh-in-docker, which downloaded a script from GitHub that wrote its
 # own ~/.zshrc with powerlevel10k, TERM=xterm and a bash-only PROMPT_COMMAND.
 # This is a small global config built from what apt installed anyway.
@@ -345,6 +343,15 @@ RUN if [ "$WITH_PLAYWRIGHT" = 1 ]; then \
 # expensive to redo, and a TOFU_VERSION bump invalidates this layer alone.
 COPY --from=tofu /opt/tofu /opt/tofu
 ENV PATH=/opt/tofu:$PATH
+
+# The only COPY from the build context, and the reason it sits this low: a COPY
+# is cached on the content of what it copies, so every edit to this script
+# invalidates the layer and everything below it. Further up — where it used to
+# be — "below it" meant the Rust toolchain, the Go copy, the from-source sqlx-cli
+# build and the Playwright apt layer, so fixing a comment in a 90-line shell
+# script cost a multi-GB rebuild. Nothing between here and the top needs the
+# file: it is read at container start, never during the build.
+COPY --chmod=0755 cb-dockerd /usr/local/bin/cb-dockerd
 
 # Last layer on purpose — it is the one that changes most often. cb feeds a
 # concrete version in via --build-arg, so a new release
