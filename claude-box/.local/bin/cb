@@ -673,6 +673,19 @@ def image_state_path():
     return os.path.join(state_dir(), "image.json")
 
 
+def fetch_json(url):
+    """Parsed JSON from `url`, or None if it could not be had.
+
+    Every caller wants a version and has a pin to fall back on, so a refused
+    lookup, a timeout, a rate limit and an error document are one answer: no.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return json.load(response)
+    except Exception:
+        return None
+
+
 def claude_version():
     """Newest published claude-code version, as a concrete value.
 
@@ -688,15 +701,172 @@ def claude_version():
     url = "https://registry.npmjs.org/{}/latest".format(
         CLAUDE_PACKAGE.replace("/", "%2f")
     )
+    payload = fetch_json(url)
     try:
-        with urllib.request.urlopen(url, timeout=3) as response:
-            return json.load(response)["version"]
-    except Exception:
+        return payload["version"]
+    except (TypeError, KeyError):
         return "latest"
+
+
+# ---------------------------------------------------------------------------
+# Toolchain versions
+#
+# uv, Go and OpenTofu arrive as images, and the Dockerfile pins each with an ARG
+# that a --build-arg overrides. cb resolves the newest release from upstream
+# rather than leaving the tag floating, for the same reason claude-code gets a
+# concrete version: a moving tag is re-resolved on a build cb did not mean to
+# change anything with. `cb update-claude` exists to redo one npm install, and a
+# Go release landing in the middle of it would invalidate the Go layer and
+# everything below — so latest is asked for when an image is built from nothing
+# or rebuilt on purpose, remembered, and reused after that.
+#
+# Each lookup is the plainest unauthenticated endpoint its project publishes, and
+# each returns None rather than raising: the Dockerfile's own pin is the fallback
+# and a build must not depend on three third parties being up.
+# ---------------------------------------------------------------------------
+
+
+def parse_uv_version(payload):
+    """uv is published to PyPI in lockstep with its image tags."""
+    try:
+        return payload["info"]["version"] or None
+    except (TypeError, KeyError):
+        return None
+
+
+def parse_go_version(payload):
+    """The download index lists releases newest first, as "go1.26.5".
+
+    Only stable ones: the index carries release candidates too, and the golang
+    image publishes those under a tag of their own that -trixie does not follow.
+    """
+    try:
+        for release in payload:
+            if release.get("stable") and release.get("version", "").startswith("go"):
+                return release["version"][len("go"):] or None
+    except TypeError:
+        return None
+    return None
+
+
+def parse_tofu_version(payload):
+    """GitHub's latest release, which excludes drafts and pre-releases."""
+    try:
+        return payload["tag_name"].lstrip("v") or None
+    except (TypeError, KeyError, AttributeError):
+        return None
+
+
+# Name to the build arg that pins it and the lookup that answers for it. The
+# name is also the key in the state file, so it stays short and lowercase.
+TOOLCHAINS = {
+    "go": ("GO_VERSION", "https://go.dev/dl/?mode=json", parse_go_version),
+    "tofu": (
+        "TOFU_VERSION",
+        "https://api.github.com/repos/opentofu/opentofu/releases/latest",
+        parse_tofu_version,
+    ),
+    "uv": ("UV_VERSION", "https://pypi.org/pypi/uv/json", parse_uv_version),
+}
+
+
+# What the image records about itself. claude-code is in there too — it is the
+# version question asked most often, and nothing else in the image can answer it.
+VERSION_LABEL = "cb.versions"
+LABELLED_VERSIONS = ("claude",) + tuple(TOOLCHAINS)
+
+
+def parse_version_label(label):
+    """Read back what the image's cb.versions label says.
+
+    Unknown and empty entries are dropped rather than raising: the label is read
+    from whatever image is tagged claude-box:latest, which may predate a
+    toolchain and leave its ARG expanding to nothing.
+    """
+    versions = {}
+    for entry in (label or "").split(","):
+        name, _, value = entry.partition("=")
+        if name in LABELLED_VERSIONS and value:
+            versions[name] = value
+    return versions
+
+
+def latest_versions():
+    """Newest upstream version per toolchain. What could not be resolved is
+    absent rather than guessed at."""
+    found = {}
+    for name, (_, url, parse) in sorted(TOOLCHAINS.items()):
+        version = parse(fetch_json(url))
+        if version:
+            found[name] = version
+    return found
+
+
+def version_build_args(versions):
+    """`X_VERSION=…` assignments, for `docker build --build-arg`."""
+    return [
+        "{}={}".format(TOOLCHAINS[name][0], version)
+        for name, version in sorted(versions.items())
+        if name in TOOLCHAINS
+    ]
+
+
+def stored_versions(stored):
+    """What the last build settled on, known toolchains only.
+
+    Anything else in there is ignored for the same reason the feature keys are:
+    a leftover or a hand edit must not decide what gets built.
+    """
+    versions = stored.get("versions")
+    if not isinstance(versions, dict):
+        return {}
+    return {
+        name: str(value)
+        for name, value in versions.items()
+        if name in TOOLCHAINS and value
+    }
+
+
+def refresh_versions(stored):
+    """Remembered versions, updated with whatever upstream answers now.
+
+    Updated rather than replaced: a lookup that fails would otherwise roll that
+    toolchain back to the Dockerfile's pin, which is a downgrade nobody asked
+    for and one that reads as a mystery rebuild.
+    """
+    versions = stored_versions(stored)
+    versions.update(latest_versions())
+    return versions
+
+
+def remember_image_state(features, versions):
+    """Both halves of what the next build should reproduce.
+
+    Features stay at the top level, where resolve_features already reads them, so
+    a file written by an older cb keeps working.
+    """
+    state = dict(features)
+    state["versions"] = versions
+    write_json(image_state_path(), state)
 
 
 def image_exists():
     return capture(["docker", "image", "inspect", CB_IMAGE]) is not None
+
+
+def image_label(name):
+    """One label off the image, or None if there is no image to read it from."""
+    out = capture(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            '{{index .Config.Labels "%s"}}' % name,
+            CB_IMAGE,
+        ]
+    )
+    return None if out is None else out.strip()
 
 
 def image_features():
@@ -705,25 +875,22 @@ def image_features():
     Read from the image's own label rather than from image.json, so the answer
     stays right when the state file has been lost or hand-edited.
     """
-    out = capture(
-        [
-            "docker",
-            "image",
-            "inspect",
-            "--format",
-            '{{index .Config.Labels "%s"}}' % FEATURE_LABEL,
-            CB_IMAGE,
-        ]
-    )
-    return None if out is None else parse_feature_label(out.strip())
+    label = image_label(FEATURE_LABEL)
+    return None if label is None else parse_feature_label(label)
 
 
-def build_image(features, no_cache=False):
+def image_versions():
+    """Which versions the image on disk was built at, the same way."""
+    label = image_label(VERSION_LABEL)
+    return {} if label is None else parse_version_label(label)
+
+
+def build_image(features, versions, no_cache=False):
     argv = ["docker", "build"]
     if no_cache:
         argv.append("--no-cache")
     argv += ["--build-arg", "CLAUDE_CODE_VERSION=" + claude_version()]
-    for assignment in feature_build_args(features):
+    for assignment in feature_build_args(features) + version_build_args(versions):
         argv += ["--build-arg", assignment]
     argv += ["--tag", CB_IMAGE, CB_DIR]
     run(argv)
@@ -736,10 +903,17 @@ def ensure_image():
     update-claude's job, not something every `cb` pays for: `cb` runs many times
     a day and almost always on a warm cache, where a build is a registry round
     trip plus twenty lines of CACHED that read like a rebuild.
+
+    Nothing is cached on a first build, so this is the one place besides
+    rebuild-image where asking upstream for the newest toolchains costs nothing.
     """
     if image_exists():
         return
-    build_image(resolve_features(read_json(image_state_path()), {}))
+    stored = read_json(image_state_path())
+    features = resolve_features(stored, {})
+    versions = refresh_versions(stored)
+    remember_image_state(features, versions)
+    build_image(features, versions)
 
 
 # ---------------------------------------------------------------------------
@@ -1133,9 +1307,14 @@ def cmd_update_claude(flags, args):
     Recreates the box here because running the new binary is the point, but only
     one that already exists: building an image is no reason to create a box in
     whatever directory the command was typed in.
+
+    The toolchains are the ones the image already has, deliberately: resolving
+    them here would bump Go or uv as a side effect of a claude-code release and
+    invalidate every layer below, which is exactly what this command avoids.
     """
     reject_extra("update-claude", args)
-    build_image(resolve_features(read_json(image_state_path()), {}))
+    stored = read_json(image_state_path())
+    build_image(resolve_features(stored, {}), stored_versions(stored))
 
     if box_for(current_workspace()) is None:
         if not DRY_RUN:
@@ -1146,6 +1325,10 @@ def cmd_update_claude(flags, args):
 
 def cmd_rebuild_image(flags, args):
     """Rebuild the shared image, optionally changing which toolchains it has.
+
+    This is also where the toolchain versions are refreshed: asking upstream for
+    the newest uv, Go and OpenTofu belongs to "rebuild the image", not to a
+    command that is supposed to touch one layer.
 
     Feature flags are remembered, so a later bare `cb rebuild-image` reproduces
     the same set. --no-cache is the nuclear option: it discards the Rust
@@ -1162,9 +1345,11 @@ def cmd_rebuild_image(flags, args):
     no_cache = "--no-cache" in args
     reject_extra("rebuild-image", [arg for arg in args if arg != "--no-cache"])
 
-    features = resolve_features(read_json(image_state_path()), overrides)
-    write_json(image_state_path(), features)
-    build_image(features, no_cache=no_cache)
+    stored = read_json(image_state_path())
+    features = resolve_features(stored, overrides)
+    versions = refresh_versions(stored)
+    remember_image_state(features, versions)
+    build_image(features, versions, no_cache=no_cache)
 
     if not DRY_RUN:
         print("\nbuilt {}. existing boxes keep the old image until "
@@ -1256,6 +1441,14 @@ def cmd_config(flags, args):
     else:
         enabled = sorted(name for name, on in features.items() if on) or ["none"]
         print("\nimage    {}  {}".format(CB_IMAGE, " ".join(enabled)))
+        versions = image_versions()
+        if versions:
+            print(
+                "         "
+                + "  ".join(
+                    "{} {}".format(name, versions[name]) for name in sorted(versions)
+                )
+            )
     return 0
 
 

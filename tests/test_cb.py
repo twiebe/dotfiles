@@ -396,6 +396,155 @@ class FeatureBuildArgsTest(unittest.TestCase):
         self.assertEqual(args, ["WITH_GO=0", "WITH_RUST=1"])
 
 
+class ParseVersionTest(unittest.TestCase):
+    """Each toolchain announces its newest release in a shape of its own. The
+    fetch is out of scope; what is covered is reading the answer, and surviving
+    one that does not arrive or does not look the way it should."""
+
+    def test_reads_uv_from_pypi(self):
+        self.assertEqual(cb.parse_uv_version({"info": {"version": "0.12.1"}}), "0.12.1")
+
+    def test_reads_go_from_the_download_index(self):
+        payload = [
+            {"version": "go1.26.5", "stable": True},
+            {"version": "go1.25.9", "stable": True},
+        ]
+        # The tag is golang:<version>-trixie, so the "go" prefix has to come off.
+        self.assertEqual(cb.parse_go_version(payload), "1.26.5")
+
+    def test_skips_an_unstable_go_release(self):
+        payload = [
+            {"version": "go1.27rc1", "stable": False},
+            {"version": "go1.26.5", "stable": True},
+        ]
+        self.assertEqual(cb.parse_go_version(payload), "1.26.5")
+
+    def test_reads_tofu_from_its_latest_release(self):
+        # The tag is <version>-minimal, so the "v" has to come off.
+        self.assertEqual(cb.parse_tofu_version({"tag_name": "v1.12.6"}), "1.12.6")
+
+    def test_nothing_arrived(self):
+        for parse in (cb.parse_uv_version, cb.parse_go_version, cb.parse_tofu_version):
+            self.assertIsNone(parse(None))
+
+    def test_something_unexpected_arrived(self):
+        # A lookup that answers HTML, an error document, or a renamed field must
+        # leave the pinned default in the Dockerfile standing.
+        for parse, junk in (
+            (cb.parse_uv_version, {"message": "Not Found"}),
+            (cb.parse_go_version, []),
+            (cb.parse_go_version, [{"stable": False}]),
+            (cb.parse_tofu_version, {"tag_name": ""}),
+        ):
+            self.assertIsNone(parse(junk))
+
+
+class VersionLabelTest(unittest.TestCase):
+    """The image records what it was built with, so `cb config` can answer "what
+    uv is in the box" without running it — and still answer after the state file
+    is gone."""
+
+    def test_reads_the_written_form(self):
+        parsed = cb.parse_version_label("claude=2.1.267,go=1.27.1,uv=0.12.12")
+        self.assertEqual(parsed, {"claude": "2.1.267", "go": "1.27.1", "uv": "0.12.12"})
+
+    def test_a_missing_label_is_empty(self):
+        self.assertEqual(cb.parse_version_label(""), {})
+        self.assertEqual(cb.parse_version_label(None), {})
+
+    def test_ignores_unknown_and_empty_entries(self):
+        # An image predating a toolchain leaves its ARG expanding to nothing.
+        parsed = cb.parse_version_label("go=1.27.1,zig=0.14.0,tofu=,nonsense")
+        self.assertEqual(parsed, {"go": "1.27.1"})
+
+
+class VersionBuildArgsTest(unittest.TestCase):
+    def test_renders_the_arg_each_toolchain_is_pinned_by(self):
+        args = cb.version_build_args({"go": "1.26.5", "uv": "0.12.1"})
+        self.assertEqual(args, ["GO_VERSION=1.26.5", "UV_VERSION=0.12.1"])
+
+    def test_ignores_a_toolchain_it_knows_nothing_about(self):
+        self.assertEqual(cb.version_build_args({"zig": "0.14.0"}), [])
+
+    def test_renders_nothing_when_nothing_was_resolved(self):
+        # No --build-arg means the Dockerfile's own pin applies.
+        self.assertEqual(cb.version_build_args({}), [])
+
+
+class StoredVersionsTest(unittest.TestCase):
+    """What the last build settled on. Read back so `cb update-claude` rebuilds
+    against the same toolchains and stays a one-layer update."""
+
+    def test_reads_what_was_remembered(self):
+        self.assertEqual(
+            cb.stored_versions({"versions": {"go": "1.26.5"}}), {"go": "1.26.5"}
+        )
+
+    def test_a_file_without_versions_reads_as_empty(self):
+        self.assertEqual(cb.stored_versions({"rust": True}), {})
+
+    def test_a_hand_mangled_versions_key_reads_as_empty(self):
+        self.assertEqual(cb.stored_versions({"versions": "1.26.5"}), {})
+
+    def test_drops_an_unknown_toolchain(self):
+        self.assertEqual(cb.stored_versions({"versions": {"zig": "0.14.0"}}), {})
+
+    def test_drops_an_empty_value(self):
+        self.assertEqual(cb.stored_versions({"versions": {"go": None}}), {})
+
+
+class RefreshVersionsTest(unittest.TestCase):
+    """A lookup that fails must not throw away the version the image already
+    has — that would silently roll a toolchain back to the Dockerfile's pin."""
+
+    def setUp(self):
+        self.addCleanup(setattr, cb, "latest_versions", cb.latest_versions)
+
+    def test_takes_what_upstream_answers(self):
+        cb.latest_versions = lambda: {"go": "1.27.0"}
+        self.assertEqual(cb.refresh_versions({"versions": {"go": "1.26.5"}})["go"], "1.27.0")
+
+    def test_keeps_what_was_remembered_when_a_lookup_fails(self):
+        cb.latest_versions = lambda: {}
+        self.assertEqual(cb.refresh_versions({"versions": {"go": "1.26.5"}})["go"], "1.26.5")
+
+    def test_keeps_the_others_when_only_one_lookup_answers(self):
+        cb.latest_versions = lambda: {"uv": "0.13.0"}
+        refreshed = cb.refresh_versions({"versions": {"go": "1.26.5", "uv": "0.12.1"}})
+        self.assertEqual(refreshed, {"go": "1.26.5", "uv": "0.13.0"})
+
+
+class UpdateClaudeTest(unittest.TestCase):
+    """`cb update-claude` exists to redo one npm install. Resolving toolchains
+    there would bump Go or uv behind the user's back and invalidate every layer
+    below it — the opposite of what the command is for."""
+
+    def setUp(self):
+        self.built = []
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        state = Path(self.tmp.name) / "image.json"
+        state.write_text('{"rust": true, "versions": {"go": "1.26.5"}}')
+
+        def forbidden():
+            raise AssertionError("update-claude must not ask upstream for versions")
+
+        for name, value in (
+            ("image_state_path", lambda: str(state)),
+            ("latest_versions", forbidden),
+            ("build_image", lambda features, versions, no_cache=False: self.built.append(versions)),
+            ("box_for", lambda workspace: None),
+            ("current_workspace", lambda: "/home/u/git/repo"),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+
+    def test_builds_against_the_versions_the_image_already_has(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            cb.cmd_update_claude({"yes": False}, [])
+        self.assertEqual(self.built, [{"go": "1.26.5"}])
+
+
 class InRootsTest(unittest.TestCase):
     """A box bind-mounts the directory it starts in and hands it to an agent
     with permissions loosened, so the gate is what stops a stray cd from

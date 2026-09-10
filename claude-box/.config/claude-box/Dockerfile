@@ -14,6 +14,15 @@
 # expand to the empty string and the build would fail with
 # `invalid reference format` on "golang:-trixie".
 #
+# The values below are a floor, not the intent: cb looks up the newest release of
+# each and passes it in with --build-arg, so a build gets current toolchains
+# without anyone editing this file. They still have to be concrete here. A moving
+# tag — golang:trixie, uv:latest — is re-resolved on every build, which would put
+# a Go release in the middle of a `cb update-claude` that meant to redo one npm
+# install and invalidate every layer below Go. These are what a bare
+# `docker build` in this directory gets, and what cb falls back to when a lookup
+# is down; bump them when the gap gets embarrassing, not routinely.
+#
 # WITH_GO and WITH_TOFU are global for the same reason. Unlike the other toggles
 # they cannot be a shell condition inside a RUN: both toolchains arrive by
 # COPY --from, and an `if` would have to copy the payload in and delete it
@@ -371,3 +380,12 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 ARG WITH_GO
 ARG WITH_TOFU
 LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},playwright=${WITH_PLAYWRIGHT},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
+
+# Which versions those features came out at. Worth recording now that cb resolves
+# them instead of this file fixing them: "what uv is in the box" otherwise has no
+# answer short of running it. Re-declared because the global ARGs above ended at
+# the first FROM, same as WITH_GO and WITH_TOFU.
+ARG UV_VERSION
+ARG GO_VERSION
+ARG TOFU_VERSION
+LABEL cb.versions="claude=${CLAUDE_CODE_VERSION},go=${GO_VERSION},tofu=${TOFU_VERSION},uv=${UV_VERSION}"
