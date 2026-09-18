@@ -37,7 +37,7 @@ jobs:
             tree_sitter: tree-sitter-macos-arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install nvim and tree-sitter-cli
         run: |
@@ -55,7 +55,7 @@ jobs:
       - name: Bake
         run: .github/scripts/bake-nvim-parsers.sh "$RUNNER_TEMP/out"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.runner }}
           path: ${{ runner.temp }}/out
@@ -65,9 +65,9 @@ jobs:
     needs: bake
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: out
           merge-multiple: true
