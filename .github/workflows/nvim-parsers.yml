@@ -27,12 +27,15 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
+            platform: linux-x86_64
             nvim: nvim-linux-x86_64
             tree_sitter: tree-sitter-linux-x64
           - runner: ubuntu-24.04-arm
+            platform: linux-aarch64
             nvim: nvim-linux-arm64
             tree_sitter: tree-sitter-linux-arm64
           - runner: macos-15
+            platform: darwin-arm64
             nvim: nvim-macos-arm64
             tree_sitter: tree-sitter-macos-arm64
     runs-on: ${{ matrix.runner }}
@@ -57,7 +60,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.runner }}
+          name: nvim-parsers-${{ matrix.platform }}
           path: ${{ runner.temp }}/out
           if-no-files-found: error
 
