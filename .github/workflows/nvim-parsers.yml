@@ -1,0 +1,83 @@
+# Bakes the tree-sitter parsers LazyVim wants for every platform in use and
+# publishes them as release assets, so no machine compiles parsers itself.
+# nvim-parsers (nvim/.local/bin) fetches the release that matches the
+# nvim-treesitter commit in lazy-lock.json.
+
+name: nvim parsers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - nvim/.config/nvim/lazy-lock.json
+      - .github/scripts/bake-nvim-parsers.sh
+      - .github/workflows/nvim-parsers.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TREE_SITTER_VERSION: 0.26.11
+
+jobs:
+  bake:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            nvim: nvim-linux-x86_64
+            tree_sitter: tree-sitter-linux-x64
+          - runner: ubuntu-24.04-arm
+            nvim: nvim-linux-arm64
+            tree_sitter: tree-sitter-linux-arm64
+          - runner: macos-15
+            nvim: nvim-macos-arm64
+            tree_sitter: tree-sitter-macos-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install nvim and tree-sitter-cli
+        run: |
+          curl -fsSL "https://github.com/neovim/neovim/releases/latest/download/${{ matrix.nvim }}.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          curl -fsSL "https://github.com/tree-sitter/tree-sitter/releases/download/v${TREE_SITTER_VERSION}/${{ matrix.tree_sitter }}.gz" | gunzip > "$RUNNER_TEMP/tree-sitter"
+          chmod +x "$RUNNER_TEMP/tree-sitter"
+          echo "$RUNNER_TEMP/${{ matrix.nvim }}/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Use the repo's nvim config
+        run: |
+          mkdir -p ~/.config
+          ln -s "$GITHUB_WORKSPACE/nvim/.config/nvim" ~/.config/nvim
+
+      - name: Bake
+        run: .github/scripts/bake-nvim-parsers.sh "$RUNNER_TEMP/out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.runner }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+
+  release:
+    needs: bake
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Publish as release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          commit=$(cat out/commit)
+          tag="nvim-parsers-${commit:0:7}"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "$tag" --notes "tree-sitter parsers for nvim-treesitter $commit"
+          gh release upload "$tag" out/*.tar.gz --clobber

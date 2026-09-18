@@ -1,0 +1,56 @@
+#!/usr/bin/env zsh
+
+# Installs the prebuilt tree-sitter parsers for this machine, so no machine
+# compiles parsers itself. They come from the GitHub release that matches the
+# nvim-treesitter commit in lazy-lock.json, baked by
+# .github/workflows/nvim-parsers.yml. The stamp file next to them tells the
+# nvim config that parsers are managed here and switches its own installing
+# and building off.
+#
+#   nvim-parsers              install unless the installed set already matches
+#   nvim-parsers --from FILE  install a locally baked tarball instead
+
+set -eu
+
+repo="twiebe/dotfiles"
+lock="${XDG_CONFIG_HOME:-$HOME/.config}/nvim/lazy-lock.json"
+site="${XDG_DATA_HOME:-$HOME/.local/share}/nvim/site"
+stamp="$site/.nvim-parsers"
+
+commit=$(sed -nE 's/.*"nvim-treesitter": \{.*"commit": "([0-9a-f]+)".*/\1/p' "$lock")
+if [[ -z "$commit" ]]; then
+  echo "nvim-parsers: no nvim-treesitter entry in $lock" >&2
+  exit 1
+fi
+
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) platform=linux-x86_64 ;;
+  Linux-aarch64) platform=linux-aarch64 ;;
+  Darwin-arm64) platform=darwin-arm64 ;;
+  *)
+    echo "nvim-parsers: no prebuilt parsers for $(uname -s) $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${1:-}" == "--from" ]]; then
+  tarball="$2"
+else
+  if [[ -f "$stamp" && "$(<"$stamp")" == "$commit" ]]; then
+    echo "parsers up to date (${commit:0:7})"
+    exit 0
+  fi
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  tarball="$tmp/nvim-parsers.tar.gz"
+  url="https://github.com/$repo/releases/download/nvim-parsers-${commit:0:7}/nvim-parsers-$platform.tar.gz"
+  echo "fetching $url"
+  curl -fsSL --retry 3 -o "$tarball" "$url"
+fi
+
+# Parsers and queries of another nvim-treesitter revision must not linger
+# next to the new set.
+rm -rf "$site/parser" "$site/queries" "$stamp"
+mkdir -p "$site"
+tar -xzf "$tarball" -C "$site"
+echo "installed $(ls "$site/parser" | wc -l | tr -d ' ') parsers ($(<"$stamp"))"
