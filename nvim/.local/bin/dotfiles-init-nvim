@@ -2,4 +2,8 @@
 
 set -ex
 
+# Prebuilt parsers first, so the restore below does not start compiling them.
+# Without a matching release nvim compiles them itself.
+"${0:h}/nvim-parsers" || echo "no prebuilt parsers for this machine, nvim will compile them"
+
 nvim --headless "+Lazy! restore" +qa
