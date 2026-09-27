@@ -1,5 +1,5 @@
 hyper - a : open -a Calendar
-hyper - e : open -a Safari
+hyper - e : open -a "Google Chrome"
 hyper - g : open -a Notes
 hyper - h : open -a /Users/thomas/Applications/Home\ Assistant.app
 hyper - i : shortcuts run "Switch Audio to Speakers"
@@ -13,6 +13,6 @@ hyper - s : open -a Ghostty
 hyper - t : open -a Signal
 hyper - u : open -a Music
 hyper - v : open ~/Downloads
-hyper - w : open -a "Google Chrome"
+hyper - w : open -a "Brave Browser"
 hyper - y : open -a WhatsApp
 hyper - z : open -a Zed
