@@ -9,3 +9,10 @@ vim.opt.clipboard = ""
 vim.g.minipairs_disable = true
 vim.keymap.set({ "n", "x" }, "y", '"+y')
 vim.keymap.set({ "n", "x" }, "Y", '"+Y')
+
+-- Root detection: always use the current working directory. LazyVim's default
+-- spec walks up from each buffer looking for lsp roots and .git / lua markers,
+-- so pickers and the explorer silently jump between roots as you switch
+-- buffers. Pinning it to cwd keeps <leader>ff, <leader>/ and the explorer on
+-- one directory until it is changed explicitly (for example <leader>fp).
+vim.g.root_spec = { "cwd" }
