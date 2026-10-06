@@ -12,6 +12,9 @@ package is mapped into the target, so claude-box/tests/ would land in $HOME; the
 alternative, a .stow-local-ignore, replaces stow's entire default ignore list
 rather than adding to it, which would quietly start stowing backup files and
 .gitignore the day one appears in that directory.
+
+The leading dot keeps the directory from reading as one more stow package next
+to claude-box/ and nvim/ at the top level of the repo.
 """
 
 import contextlib
