@@ -23,17 +23,20 @@
 # `docker build` in this directory gets, and what cb falls back to when a lookup
 # is down; bump them when the gap gets embarrassing, not routinely.
 #
-# WITH_GO and WITH_TOFU are global for the same reason. Unlike the other toggles
-# they cannot be a shell condition inside a RUN: both toolchains arrive by
-# COPY --from, and an `if` would have to copy the payload in and delete it
-# afterwards, which leaves it in the layer. The stage aliases below pick an
-# empty directory instead, so `go` and `tofu` name something either way and the
-# COPY lines further down need no knowledge of the toggle.
+# WITH_GO, WITH_TOFU and WITH_KUBERNETES are global for the same reason. Unlike
+# the other toggles they cannot be a shell condition inside a RUN: all three
+# arrive by COPY --from, and an `if` would have to copy the payload in and
+# delete it afterwards, which leaves it in the layer. The stage aliases below
+# pick an empty directory instead, so `go`, `tofu` and `kubernetes` name
+# something either way and the COPY lines further down need no knowledge of the
+# toggle.
 ARG UV_VERSION=0.12.1
 ARG GO_VERSION=1.26.5
 ARG TOFU_VERSION=1.12.6
+ARG KUBECTL_VERSION=1.37.1
 ARG WITH_GO=1
 ARG WITH_TOFU=1
+ARG WITH_KUBERNETES=1
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 FROM golang:${GO_VERSION}-trixie AS go-1
@@ -54,11 +57,20 @@ FROM node:26-trixie-slim AS tofu-0
 RUN mkdir -p /opt/tofu
 FROM tofu-${WITH_TOFU} AS tofu
 
+# Same shape as tofu: registry.k8s.io/kubectl is distroless, carries the binary
+# at /bin/kubectl, and its tag keeps the "v" that cb strips from the version.
+FROM registry.k8s.io/kubectl:v${KUBECTL_VERSION} AS kubectl-bin
+FROM node:26-trixie-slim AS kubernetes-1
+COPY --from=kubectl-bin /bin/kubectl /opt/kubernetes/kubectl
+FROM node:26-trixie-slim AS kubernetes-0
+RUN mkdir -p /opt/kubernetes
+FROM kubernetes-${WITH_KUBERNETES} AS kubernetes
+
 # Debian trixie rather than Alpine: projects get built inside this container,
 # and musl costs more there than Alpine's fresher packages gain. Every tool
 # comes from the distro repos — no `wget | sh`, no GitHub release downloads.
 # The only exceptions are claude-code (npm, the whole point of the box) plus uv,
-# Go and OpenTofu, all copied out of official images (see above).
+# Go, OpenTofu and kubectl, all copied out of official images (see above).
 FROM node:26-trixie-slim
 
 # Build-time knobs default to the full image: cb passes a --build-arg per
@@ -353,6 +365,33 @@ RUN if [ "$WITH_PLAYWRIGHT" = 1 ]; then \
 COPY --from=tofu /opt/tofu /opt/tofu
 ENV PATH=/opt/tofu:$PATH
 
+# kubectl and kustomize, for a checkout that deploys to Kubernetes:
+# `kustomize build overlays/dev | kubectl apply -f -`, `kubectl diff -k`.
+#
+# kubectl comes out of upstream's image like tofu, not from trixie, because of
+# its version skew policy: a client is supported against servers one minor
+# version either side of it, and trixie's 1.32 is five minors behind upstream —
+# old enough that clusters on a current release are outside that window.
+#
+# kustomize has no such policy to break, so it stays with the apt rule at the
+# top of this file. The standalone binary rather than only the copy embedded in
+# `kubectl kustomize`: that one can build but not `kustomize edit`, and
+# Makefiles and CI scripts call `kustomize` by name.
+#
+# No kubeconfig here: cluster credentials are per project and per person, and
+# the box gets them the same way it gets any other secret, not from the image.
+#
+# Small layers, below everything expensive, so a KUBECTL_VERSION bump
+# invalidates them and the claude-code layer alone.
+COPY --from=kubernetes /opt/kubernetes /opt/kubernetes
+ENV PATH=/opt/kubernetes:$PATH
+ARG WITH_KUBERNETES=1
+RUN if [ "$WITH_KUBERNETES" = 1 ]; then \
+      sudo apt-get update \
+      && sudo apt-get install -y --no-install-recommends kustomize \
+      && sudo rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # The only COPY from the build context, and the reason it sits this low: a COPY
 # is cached on the content of what it copies, so every edit to this script
 # invalidates the layer and everything below it. Further up — where it used to
@@ -379,7 +418,7 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # often.
 ARG WITH_GO
 ARG WITH_TOFU
-LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},playwright=${WITH_PLAYWRIGHT},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
+LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},kubernetes=${WITH_KUBERNETES},playwright=${WITH_PLAYWRIGHT},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
 
 # Which versions those features came out at. Worth recording now that cb resolves
 # them instead of this file fixing them: "what uv is in the box" otherwise has no
@@ -387,5 +426,6 @@ LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},playwright=${WITH_PLAYWRI
 # the first FROM, same as WITH_GO and WITH_TOFU.
 ARG UV_VERSION
 ARG GO_VERSION
+ARG KUBECTL_VERSION
 ARG TOFU_VERSION
-LABEL cb.versions="claude=${CLAUDE_CODE_VERSION},go=${GO_VERSION},tofu=${TOFU_VERSION},uv=${UV_VERSION}"
+LABEL cb.versions="claude=${CLAUDE_CODE_VERSION},go=${GO_VERSION},kubectl=${KUBECTL_VERSION},tofu=${TOFU_VERSION},uv=${UV_VERSION}"

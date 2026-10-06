@@ -421,10 +421,16 @@ class ParseVersionTest(unittest.TestCase):
 
     def test_reads_tofu_from_its_latest_release(self):
         # The tag is <version>-minimal, so the "v" has to come off.
-        self.assertEqual(cb.parse_tofu_version({"tag_name": "v1.12.6"}), "1.12.6")
+        self.assertEqual(cb.parse_github_release({"tag_name": "v1.12.6"}), "1.12.6")
+
+    def test_reads_kubectl_from_its_latest_release(self):
+        # The Dockerfile adds the "v" back for registry.k8s.io/kubectl, so the
+        # stored version stays comparable with the other toolchains.
+        self.assertEqual(cb.parse_github_release({"tag_name": "v1.37.1"}), "1.37.1")
+        self.assertIn("kubectl", cb.TOOLCHAINS)
 
     def test_nothing_arrived(self):
-        for parse in (cb.parse_uv_version, cb.parse_go_version, cb.parse_tofu_version):
+        for parse in (cb.parse_uv_version, cb.parse_go_version, cb.parse_github_release):
             self.assertIsNone(parse(None))
 
     def test_something_unexpected_arrived(self):
@@ -434,7 +440,7 @@ class ParseVersionTest(unittest.TestCase):
             (cb.parse_uv_version, {"message": "Not Found"}),
             (cb.parse_go_version, []),
             (cb.parse_go_version, [{"stable": False}]),
-            (cb.parse_tofu_version, {"tag_name": ""}),
+            (cb.parse_github_release, {"tag_name": ""}),
         ):
             self.assertIsNone(parse(junk))
 
