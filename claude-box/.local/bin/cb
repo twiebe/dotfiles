@@ -329,7 +329,7 @@ def extract_flags(args):
 # stand on its own, without cb's --build-arg list in front of it.
 # ---------------------------------------------------------------------------
 
-IMAGE_FEATURES = ("docker", "go", "playwright", "rust", "sqlx", "tofu")
+IMAGE_FEATURES = ("docker", "go", "kubernetes", "playwright", "rust", "sqlx", "tofu")
 
 # The image carries its own answer as a label, so `docker inspect` stays
 # authoritative even when the state file has been lost or hand-edited. The file
@@ -722,18 +722,18 @@ def claude_version():
 # ---------------------------------------------------------------------------
 # Toolchain versions
 #
-# uv, Go and OpenTofu arrive as images, and the Dockerfile pins each with an ARG
-# that a --build-arg overrides. cb resolves the newest release from upstream
-# rather than leaving the tag floating, for the same reason claude-code gets a
-# concrete version: a moving tag is re-resolved on a build cb did not mean to
-# change anything with. `cb update-claude` exists to redo one npm install, and a
+# uv, Go, OpenTofu and kubectl arrive as images, and the Dockerfile pins each
+# with an ARG that a --build-arg overrides. cb resolves the newest release from
+# upstream rather than leaving the tag floating, for the same reason claude-code
+# gets a concrete version: a moving tag is re-resolved on a build cb did not
+# mean to change anything with. `cb update-claude` exists to redo one npm install, and a
 # Go release landing in the middle of it would invalidate the Go layer and
 # everything below — so latest is asked for when an image is built from nothing
 # or rebuilt on purpose, remembered, and reused after that.
 #
 # Each lookup is the plainest unauthenticated endpoint its project publishes, and
 # each returns None rather than raising: the Dockerfile's own pin is the fallback
-# and a build must not depend on three third parties being up.
+# and a build must not depend on four third parties being up.
 # ---------------------------------------------------------------------------
 
 
@@ -760,8 +760,13 @@ def parse_go_version(payload):
     return None
 
 
-def parse_tofu_version(payload):
-    """GitHub's latest release, which excludes drafts and pre-releases."""
+def parse_github_release(payload):
+    """GitHub's latest release, which excludes drafts and pre-releases.
+
+    Both image tags that follow a GitHub release are built from the bare
+    version: tofu's is <version>-minimal, and the Dockerfile puts kubectl's "v"
+    back itself.
+    """
     try:
         return payload["tag_name"].lstrip("v") or None
     except (TypeError, KeyError, AttributeError):
@@ -772,10 +777,15 @@ def parse_tofu_version(payload):
 # name is also the key in the state file, so it stays short and lowercase.
 TOOLCHAINS = {
     "go": ("GO_VERSION", "https://go.dev/dl/?mode=json", parse_go_version),
+    "kubectl": (
+        "KUBECTL_VERSION",
+        "https://api.github.com/repos/kubernetes/kubernetes/releases/latest",
+        parse_github_release,
+    ),
     "tofu": (
         "TOFU_VERSION",
         "https://api.github.com/repos/opentofu/opentofu/releases/latest",
-        parse_tofu_version,
+        parse_github_release,
     ),
     "uv": ("UV_VERSION", "https://pypi.org/pypi/uv/json", parse_uv_version),
 }
@@ -1357,7 +1367,7 @@ def cmd_rebuild_image(flags, args):
     """Rebuild the shared image, optionally changing which toolchains it has.
 
     This is also where the toolchain versions are refreshed: asking upstream for
-    the newest uv, Go and OpenTofu belongs to "rebuild the image", not to a
+    the newest uv, Go, OpenTofu and kubectl belongs to "rebuild the image", not to a
     command that is supposed to touch one layer.
 
     Feature flags are remembered, so a later bare `cb rebuild-image` reproduces
