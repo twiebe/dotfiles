@@ -601,34 +601,105 @@ class RefreshVersionsTest(unittest.TestCase):
         self.assertEqual(refreshed, {"go": "1.26.5", "uv": "0.13.0"})
 
 
-class UpdateClaudeTest(unittest.TestCase):
-    """`cb update-claude` exists to redo one npm install. Resolving toolchains
-    there would bump Go or uv behind the user's back and invalidate every layer
-    below it — the opposite of what the command is for."""
+class ImageBuildTest(unittest.TestCase):
+    """Two images: claude-box:base holds everything but claude-code, and
+    claude-box:latest is base plus one npm install. update-claude only ever
+    builds the second, so nothing that happened to the build cache of the first
+    can make it rebuild Rust or Playwright.
+
+    The docker commands are recorded rather than run.
+    """
 
     def setUp(self):
-        self.built = []
+        self.builds = []
+        self.images = {cb.BASE_IMAGE, cb.CB_IMAGE}
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         state = Path(self.tmp.name) / "image.json"
-        state.write_text('{"rust": true, "versions": {"go": "1.26.5"}}')
+        state.write_text('{"rust": false, "versions": {"go": "1.26.5"}}')
 
-        def forbidden():
-            raise AssertionError("update-claude must not ask upstream for versions")
+        def record(argv, env=None, quiet=False, check=True):
+            self.builds.append(list(argv))
+            return 0
 
         for name, value in (
             ("image_state_path", lambda: str(state)),
-            ("latest_versions", forbidden),
-            ("build_image", lambda features, versions, no_cache=False: self.built.append(versions)),
-            ("current_workspace", lambda: "/home/u/git/repo"),
+            ("image_exists", lambda image=cb.CB_IMAGE: image in self.images),
+            ("latest_versions", lambda: {"go": "9.9.9"}),
+            ("claude_version", lambda: "2.0.0"),
+            ("run", record),
         ):
             self.addCleanup(setattr, cb, name, getattr(cb, name))
             setattr(cb, name, value)
 
-    def test_builds_against_the_versions_the_image_already_has(self):
-        with contextlib.redirect_stdout(io.StringIO()):
-            cb.cmd_update_claude({"yes": False}, [])
-        self.assertEqual(self.built, [{"go": "1.26.5"}])
+    def quietly(self, function, *args):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return function(*args)
+
+    def tags(self):
+        return [flag_values(argv, "--tag") for argv in self.builds]
+
+    def test_build_image_builds_base_then_claude(self):
+        cb.build_image({"rust": True}, {"go": "1.26.5"})
+        self.assertEqual(self.tags(), [[cb.BASE_IMAGE], [cb.CB_IMAGE]])
+
+    def test_the_base_build_knows_nothing_of_claude(self):
+        cb.build_image({"rust": True}, {"go": "1.26.5"})
+        base = self.builds[0]
+        self.assertEqual(flag_values(base, "--file"), [])
+        self.assertFalse(any(a.startswith("CLAUDE_CODE_VERSION=") for a in base))
+        self.assertIn("GO_VERSION=1.26.5", flag_values(base, "--build-arg"))
+
+    def test_the_claude_build_starts_from_base(self):
+        cb.build_image({"rust": True}, {})
+        claude = self.builds[1]
+        self.assertEqual(flag_values(claude, "--file"), [cb.CLAUDE_DOCKERFILE])
+        self.assertIn("CLAUDE_CODE_VERSION=2.0.0", flag_values(claude, "--build-arg"))
+        self.assertIn("BASE_IMAGE=" + cb.BASE_IMAGE, flag_values(claude, "--build-arg"))
+
+    def test_no_cache_applies_to_the_base(self):
+        cb.build_image({}, {}, no_cache=True)
+        self.assertIn("--no-cache", self.builds[0])
+
+    def test_update_claude_builds_only_the_claude_layer(self):
+        self.quietly(cb.cmd_update_claude, {"yes": False}, [])
+        self.assertEqual(self.tags(), [[cb.CB_IMAGE]])
+        self.assertEqual(flag_values(self.builds[0], "--file"), [cb.CLAUDE_DOCKERFILE])
+
+    def test_update_claude_without_a_base_refuses(self):
+        # Building the base here would be exactly the rebuild this command
+        # exists to avoid.
+        self.images = {cb.CB_IMAGE}
+        with self.assertRaises(cb.CbError):
+            self.quietly(cb.cmd_update_claude, {"yes": False}, [])
+        self.assertEqual(self.builds, [])
+
+    def test_ensure_image_leaves_a_complete_pair_alone(self):
+        self.quietly(cb.ensure_image)
+        self.assertEqual(self.builds, [])
+
+    def test_ensure_image_builds_both_without_a_base(self):
+        # Also the upgrade path: an install from before the split has only
+        # claude-box:latest.
+        self.images = {cb.CB_IMAGE}
+        self.quietly(cb.ensure_image)
+        self.assertEqual(self.tags(), [[cb.BASE_IMAGE], [cb.CB_IMAGE]])
+        self.assertIn("GO_VERSION=9.9.9", flag_values(self.builds[0], "--build-arg"))
+
+    def test_ensure_image_builds_only_claude_when_base_is_there(self):
+        self.images = {cb.BASE_IMAGE}
+        self.quietly(cb.ensure_image)
+        self.assertEqual(self.tags(), [[cb.CB_IMAGE]])
+
+
+class ImageVersionsTest(unittest.TestCase):
+    def test_claude_comes_from_its_own_label(self):
+        labels = {cb.VERSION_LABEL: "go=1.26.5,uv=0.1", cb.CLAUDE_LABEL: "2.0.0"}
+        self.addCleanup(setattr, cb, "image_label", cb.image_label)
+        cb.image_label = lambda name, image=cb.CB_IMAGE: labels.get(name)
+        self.assertEqual(
+            cb.image_versions(), {"go": "1.26.5", "uv": "0.1", "claude": "2.0.0"}
+        )
 
 
 class InRootsTest(unittest.TestCase):
@@ -1252,49 +1323,6 @@ class ExecArgvTest(unittest.TestCase):
         os.environ["TERM"] = "xterm-ghostty"
         argv = cb.exec_argv("cb-box", ["true"], tty=False)
         self.assertEqual(flag_values(argv, "--env"), [])
-
-
-class EnsureImageTest(unittest.TestCase):
-    """An image from before cb-entry would fail every run with a bare docker
-    "no such file" after cb has already exec'd away, so it counts as missing."""
-
-    def setUp(self):
-        self.built = []
-        self.label = "1"
-        self.exists = True
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        state = Path(self.tmp.name) / "image.json"
-        state.write_text('{"rust": false, "versions": {"go": "1.26.5"}}')
-        for name, value in (
-            ("image_state_path", lambda: str(state)),
-            ("image_exists", lambda: self.exists),
-            ("image_label", lambda name: self.label if name == cb.ENTRY_LABEL else None),
-            ("latest_versions", lambda: {"go": "9.9.9"}),
-            ("build_image", lambda features, versions, no_cache=False: self.built.append(versions)),
-        ):
-            self.addCleanup(setattr, cb, name, getattr(cb, name))
-            setattr(cb, name, value)
-
-    def ensure(self):
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            cb.ensure_image()
-
-    def test_a_current_image_is_left_alone(self):
-        self.ensure()
-        self.assertEqual(self.built, [])
-
-    def test_an_image_without_cb_entry_is_rebuilt_at_its_own_versions(self):
-        # Like update-claude: only the layers from cb-entry down change.
-        self.label = None
-        self.ensure()
-        self.assertEqual(self.built, [{"go": "1.26.5"}])
-
-    def test_a_missing_image_is_built_at_the_newest_versions(self):
-        self.exists = False
-        self.label = None
-        self.ensure()
-        self.assertEqual(self.built, [{"go": "9.9.9"}])
 
 
 class RunningBoxesTest(unittest.TestCase):

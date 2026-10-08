@@ -418,21 +418,18 @@ RUN if [ "$WITH_KUBERNETES" = 1 ]; then \
 COPY --chmod=0755 cb-dockerd /usr/local/bin/cb-dockerd
 COPY --chmod=0755 cb-entry /usr/local/bin/cb-entry
 
-# Last layer on purpose — it is the one that changes most often. cb feeds a
-# concrete version in via --build-arg, so a new release
-# invalidates this layer and nothing above it. That is what lets the next
-# `cb run` pick up a new claude-code without --no-cache.
-ARG CLAUDE_CODE_VERSION=latest
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+# claude-code is not in this file. It changes more often than everything above
+# together, and cb installs it from Dockerfile.claude on top of the image this
+# file produces (claude-box:base), so `cb update-claude` never builds a layer
+# of this one — not even when the build cache for it is gone.
 
 # What this image was actually built with, so `docker inspect` can answer it.
 # cb reads this label rather than its own state file: the file only remembers
 # what to build next time and may be lost or hand-edited, while the label
 # travels with the image it describes.
 #
-# Last instruction on purpose — a LABEL is metadata and rebuilding it costs
-# nothing, so it must not sit above the claude-code layer that changes most
-# often.
+# Last instructions on purpose — a LABEL is metadata and rebuilding it costs
+# nothing, so it must not sit above a layer that is expensive to redo.
 ARG WITH_GO
 ARG WITH_TOFU
 LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},kubernetes=${WITH_KUBERNETES},playwright=${WITH_PLAYWRIGHT},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
@@ -445,9 +442,5 @@ ARG UV_VERSION
 ARG GO_VERSION
 ARG KUBECTL_VERSION
 ARG TOFU_VERSION
-LABEL cb.versions="claude=${CLAUDE_CODE_VERSION},go=${GO_VERSION},kubectl=${KUBECTL_VERSION},tofu=${TOFU_VERSION},uv=${UV_VERSION}"
+LABEL cb.versions="go=${GO_VERSION},kubectl=${KUBECTL_VERSION},tofu=${TOFU_VERSION},uv=${UV_VERSION}"
 
-# cb runs every box as `cb-entry …`. An image without it would fail each run
-# after cb has handed over to docker, so cb checks for this label first and
-# rebuilds an image that lacks it.
-LABEL cb.entry=1
