@@ -19,6 +19,7 @@ _cb() {
     'rebuild-image:rebuild the shared image'
     'update-claude:rebuild with the newest claude-code, then recreate'
     'config:show or set this box'"'"'s settings'
+    'volume:prune the volumes cb keeps'
   )
   features=(docker go kubernetes playwright rust sqlx tofu)
 
@@ -36,6 +37,13 @@ _cb() {
         ${^features/#/--with-} ${^features/#/--without-}
       ;;
     config) _values 'setting' 'docker' 'force' '--prune' ;;
+    volume)
+      if (( CURRENT == 3 )); then
+        _values 'action' 'prune'
+      else
+        _values 'volume' 'all' 'playwright'
+      fi
+      ;;
   esac
 }
 

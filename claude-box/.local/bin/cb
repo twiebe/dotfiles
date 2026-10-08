@@ -243,6 +243,7 @@ SUBCOMMANDS = (
     "rebuild-image",
     "update-claude",
     "config",
+    "volume",
 )
 
 # Everything after these is a command line of its own and is left untouched:
@@ -1037,6 +1038,21 @@ def history_volume(workspace):
     return "cb-history-" + path_hash(workspace)
 
 
+# Browsers Playwright downloads, shared by every box and kept across
+# `cb recreate`. Home only lives as long as the container, so without this a
+# project's `npx playwright install` starts from zero after every recreate.
+# Shared rather than per repo because a revision is the same bytes whichever
+# project asked for it: one download per revision per machine.
+#
+# The default location, so no PLAYWRIGHT_BROWSERS_PATH is needed and a project
+# that sets its own is left alone. The image creates the directory as node;
+# docker copies that ownership into the volume when it first mounts it, and
+# would otherwise create it root-owned — along with ~/.cache itself, which
+# CARGO_TARGET_DIR lives under.
+PLAYWRIGHT_VOLUME = "cb-playwright"
+PLAYWRIGHT_DIR = "/home/{}/.cache/ms-playwright".format(BOX_USER)
+
+
 def container_env(docker):
     """The environment baked into a box at creation time.
 
@@ -1053,6 +1069,11 @@ def container_env(docker):
         # back to plain vim outside Claude Code. claude is exec'd without a
         # shell, so this cannot live in a zsh startup file.
         "VISUAL": BOX_CLAUDE_DIR + "/skills/reply/editor.sh",
+        # `playwright install` deletes every revision no installed Playwright
+        # still links to, and it checks the links by path. In the shared volume
+        # the other boxes' node_modules are not visible, so without this each box
+        # would delete the browsers of every other one.
+        "PLAYWRIGHT_SKIP_BROWSER_GC": "1",
     }
     for name in PASSTHROUGH_ENV:
         value = os.environ.get(name)
@@ -1109,10 +1130,11 @@ def create_argv(workspace, docker):
         (HOST_CLAUDE_DIR, BOX_CLAUDE_DIR),
     ):
         argv += ["--mount", "type=bind,source={},target={}".format(source, target)]
-    argv += [
-        "--mount",
-        "type=volume,source={},target=/commandhistory".format(history_volume(workspace)),
-    ]
+    for source, target in (
+        (history_volume(workspace), "/commandhistory"),
+        (PLAYWRIGHT_VOLUME, PLAYWRIGHT_DIR),
+    ):
+        argv += ["--mount", "type=volume,source={},target={}".format(source, target)]
 
     for key, value in container_env(docker).items():
         argv += ["--env", "{}={}".format(key, value)]
@@ -1546,6 +1568,91 @@ def prune_settings():
     return 0
 
 
+VOLUME_TARGETS = ("all", "playwright")
+
+
+def cmd_volume(flags, args):
+    """`cb volume prune <all|playwright>`: give back the disk cb's volumes hold.
+
+    playwright empties the shared browser cache, which only grows since GC is
+    off (see container_env). It is emptied rather than removed because every box
+    has it mounted, and docker refuses to remove a volume any container uses,
+    even a stopped one. The next `playwright install` fetches what is needed.
+
+    all adds the shell history volumes no container uses any more — a checkout
+    whose box is gone. The history of a box that still exists is kept.
+    """
+    if len(args) != 2 or args[0] != "prune" or args[1] not in VOLUME_TARGETS:
+        raise UsageError("usage: cb volume prune <{}>".format("|".join(VOLUME_TARGETS)))
+
+    histories = []
+    if args[1] == "all":
+        histories = orphaned_history_volumes()
+    has_browsers = capture(["docker", "volume", "inspect", PLAYWRIGHT_VOLUME]) is not None
+
+    if not histories and not has_browsers:
+        print("nothing to prune")
+        return 0
+    if has_browsers:
+        print("empty:  " + PLAYWRIGHT_VOLUME)
+    if histories:
+        print("remove: " + " ".join(histories))
+    if not confirm("prune?", flags["yes"] or DRY_RUN):
+        raise CbError("aborted")
+
+    if has_browsers:
+        run(empty_volume_argv(PLAYWRIGHT_VOLUME), quiet=True)
+    if histories:
+        run(["docker", "volume", "rm"] + histories, quiet=True)
+    return 0
+
+
+def empty_volume_argv(volume):
+    """Delete everything inside `volume` but the volume itself.
+
+    A throwaway container from cb's own image, because that is the one image
+    certain to be there. --entrypoint rather than a command after the image, so
+    nothing the image might ever run first gets in the way.
+    """
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--mount",
+        "type=volume,source={},target=/volume".format(volume),
+        "--entrypoint",
+        "find",
+        CB_IMAGE,
+        "/volume",
+        "-mindepth",
+        "1",
+        "-delete",
+    ]
+
+
+def orphaned_history_volumes():
+    """cb-history-* volumes that no container, running or stopped, refers to.
+
+    `dangling=true` is docker's own answer to that. The name filter matches
+    anywhere in the name, hence the prefix check on what comes back.
+    """
+    out = capture(
+        [
+            "docker",
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            "dangling=true",
+            "--filter",
+            "name=cb-history-",
+        ]
+    )
+    return sorted(
+        name for name in (out or "").split() if name.startswith("cb-history-")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -1563,6 +1670,9 @@ USAGE = """usage: cb [command] [options]
   cb update-claude         rebuild with the newest claude-code, then recreate
   cb rebuild-image [--no-cache] [--with-X|--without-X]…
   cb config [KEY [VALUE]] [--prune]
+  cb volume prune playwright
+                           empty the browser cache every box shares
+  cb volume prune all      that, plus the shell history of boxes that are gone
 
 options
   --docker, --no-docker    give this box its own docker daemon; remembered
@@ -1612,6 +1722,7 @@ COMMANDS = {
     "rebuild-image": cmd_rebuild_image,
     "update-claude": cmd_update_claude,
     "config": cmd_config,
+    "volume": cmd_volume,
 }
 
 

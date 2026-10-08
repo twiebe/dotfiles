@@ -331,7 +331,8 @@ ENV CARGO_TARGET_DIR=/home/node/.cache/cargo-target
 # revision from the @playwright/test version a project has installed, and
 # `playwright install` removes revisions it does not need — so a baked-in
 # browser is ~110 MB that the first project run deletes. Projects download
-# their own, once per revision per machine.
+# their own, once per revision per machine: cb mounts a volume shared by every
+# box over the directory created below.
 #
 # @latest rather than a pin for the same reason: the apt package list for
 # chromium barely moves between Playwright releases, and nothing here is
@@ -350,6 +351,13 @@ RUN if [ "$WITH_PLAYWRIGHT" = 1 ]; then \
       && sudo npx --yes playwright@latest install-deps chromium \
       && sudo rm -rf /var/lib/apt/lists/* /root/.npm; \
     fi
+
+# The mount point of cb's shared browser volume, created here so that it and
+# ~/.cache above it belong to node. Docker copies the mount point's ownership
+# into a fresh volume; without the directory it creates both as root, and
+# neither `playwright install` nor cargo (CARGO_TARGET_DIR) can write there.
+# Unconditional because cb mounts the volume whatever the image was built with.
+RUN mkdir -p /home/node/.cache/ms-playwright
 
 # OpenTofu, for a checkout whose infrastructure is code: `tofu init`,
 # `tofu plan` and `tofu apply` against its .tf files. Not in Debian, so it comes
