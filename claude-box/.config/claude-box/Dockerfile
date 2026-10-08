@@ -134,6 +134,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   just \
   less \
   lua5.4 \
+  pandoc \
   pkg-config \
   procps \
   python3 \
