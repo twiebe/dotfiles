@@ -186,12 +186,18 @@ RUN if [ "$WITH_RUST" = 1 ]; then \
 # not needed and would break the no-third-party-repo rule at the top of this
 # file. Note the name: docker-compose-v2 is a Ubuntu package and does not exist
 # in Debian.
+#
+# docker-buildx is the BuildKit client. Without it `docker build` falls back to
+# the deprecated classic builder, and anything asking for BuildKit — cb itself
+# when run inside a box, any Dockerfile with a `# syntax` line or COPY --chmod —
+# fails with "BuildKit is enabled but the buildx component is missing".
 ARG WITH_DOCKER=1
 RUN if [ "$WITH_DOCKER" = 1 ]; then \
       apt-get update \
       && apt-get install -y --no-install-recommends \
         docker.io \
         docker-cli \
+        docker-buildx \
         docker-compose \
         fuse-overlayfs \
       && rm -rf /var/lib/apt/lists/*; \
