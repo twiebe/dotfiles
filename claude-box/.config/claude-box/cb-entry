@@ -1,0 +1,12 @@
+#!/bin/sh
+# Entrypoint of every claude box: cb runs `cb-entry claude …` or `cb-entry zsh`
+# as the container's command, so whatever has to happen before the user's
+# process happens here, once per container.
+#
+# cb-dockerd needs root and reads CB_DIND, which sudo would otherwise drop. It
+# is a no-op for a box without docker. Its failure must not cost the user their
+# session: cb-dockerd has already said why on stderr, and claude still works
+# without a daemon.
+sudo --preserve-env=CB_DIND /usr/local/bin/cb-dockerd || true
+
+exec "$@"

@@ -240,19 +240,63 @@ class PickSubcommandTest(unittest.TestCase):
     """`cb` forwards its line to claude, so the first token decides whether the
     line belongs to cb at all."""
 
-    def test_no_arguments_means_up(self):
-        self.assertEqual(cb.pick_subcommand([]), ("up", []))
+    def test_no_arguments_means_run(self):
+        self.assertEqual(cb.pick_subcommand([]), ("run", []))
 
     def test_a_leading_subcommand_is_taken(self):
-        self.assertEqual(cb.pick_subcommand(["down", "--all"]), ("down", ["--all"]))
+        self.assertEqual(cb.pick_subcommand(["ls", "."]), ("ls", ["."]))
 
     def test_anything_else_is_up_with_claude_arguments(self):
-        self.assertEqual(cb.pick_subcommand(["-c"]), ("up", ["-c"]))
+        self.assertEqual(cb.pick_subcommand(["-c"]), ("run", ["-c"]))
 
     def test_a_subcommand_name_later_on_the_line_belongs_to_claude(self):
         # `cb -p down` asks claude about something called down; it is not
-        # cb's teardown command.
-        self.assertEqual(cb.pick_subcommand(["-p", "down"]), ("up", ["-p", "down"]))
+        # a subcommand.
+        self.assertEqual(cb.pick_subcommand(["-p", "down"]), ("run", ["-p", "down"]))
+
+
+class LeadingFlagsTest(unittest.TestCase):
+    """`cb --docker shell` is a shell with docker, not claude asked about
+    "shell": cb's own flags may come before the subcommand."""
+
+    def test_subcommand_after_a_toggle(self):
+        self.assertEqual(cb.pick_subcommand(["--docker", "shell"]), ("shell", ["--docker"]))
+
+    def test_subcommand_after_a_value_flag(self):
+        self.assertEqual(
+            cb.pick_subcommand(["-v", "/x", "shell"]), ("shell", ["-v", "/x"])
+        )
+
+    def test_the_value_of_a_value_flag_is_not_a_subcommand(self):
+        # A directory called ls is a mount source, not the ls command.
+        self.assertEqual(cb.pick_subcommand(["-v", "ls"]), ("run", ["-v", "ls"]))
+
+    def test_a_claude_flag_still_ends_the_search(self):
+        self.assertEqual(cb.pick_subcommand(["-c", "shell"]), ("run", ["-c", "shell"]))
+
+    def test_removed_word_after_a_flag_is_refused(self):
+        def started(flags, command):
+            raise AssertionError("started a box for " + repr(command))
+
+        self.addCleanup(setattr, cb, "start", cb.start)
+        cb.start = started
+        with self.assertRaises(cb.UsageError):
+            cb.main(["--docker", "down"])
+
+    def test_dry_run_before_exec(self):
+        self.addCleanup(setattr, cb, "DRY_RUN", False)
+        for name, value in (
+            ("running_boxes", lambda: [("cb-a-1-abcd", "now", "/w")]),
+            ("current_workspace", lambda: "/w"),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cb.main(["--dry-run", "exec", "ls", "--dry-run"])
+        line = out.getvalue().strip()
+        self.assertTrue(line.startswith("+ docker exec"), line)
+        self.assertTrue(line.endswith("cb-a-1-abcd ls --dry-run"), line)
 
 
 class ExtractFlagsTest(unittest.TestCase):
@@ -305,18 +349,30 @@ class ExtractFlagsTest(unittest.TestCase):
         flags, rest = cb.extract_flags(["--docker", "--", "-c"])
         self.assertEqual((flags["docker"], rest), (True, ["-c"]))
 
-    def test_no_attach_defaults_to_false(self):
-        flags, _ = cb.extract_flags([])
-        self.assertIs(flags["no_attach"], False)
-
-    def test_no_attach_is_recognised(self):
-        # `cb up --no-attach` brings the box up without running claude in it.
-        flags, rest = cb.extract_flags(["up", "--no-attach"])
-        self.assertEqual((flags["no_attach"], rest), (True, ["up"]))
-
     def test_help_is_cbs_own(self):
         flags, _ = cb.extract_flags(["--help"])
         self.assertIs(flags["help"], True)
+
+    def test_volumes_default_to_empty(self):
+        flags, _ = cb.extract_flags([])
+        self.assertEqual(flags["volumes"], [])
+
+    def test_volume_takes_the_next_argument(self):
+        flags, rest = cb.extract_flags(["-v", "../lib", "-c"])
+        self.assertEqual((flags["volumes"], rest), (["../lib"], ["-c"]))
+
+    def test_volume_long_form_and_repetition(self):
+        flags, _ = cb.extract_flags(["--volume", "/a", "-v", "/b:ro"])
+        self.assertEqual(flags["volumes"], ["/a", "/b:ro"])
+
+    def test_volume_without_a_value_is_refused(self):
+        # `cb -v` meaning claude's --version must not start a box.
+        with self.assertRaises(cb.UsageError):
+            cb.extract_flags(["-v"])
+
+    def test_v_after_double_dash_is_claudes(self):
+        flags, rest = cb.extract_flags(["--", "-v"])
+        self.assertEqual((flags["volumes"], rest), ([], ["-v"]))
 
 
 class FeatureFlagsTest(unittest.TestCase):
@@ -564,7 +620,6 @@ class UpdateClaudeTest(unittest.TestCase):
             ("image_state_path", lambda: str(state)),
             ("latest_versions", forbidden),
             ("build_image", lambda features, versions, no_cache=False: self.built.append(versions)),
-            ("box_for", lambda workspace: None),
             ("current_workspace", lambda: "/home/u/git/repo"),
         ):
             self.addCleanup(setattr, cb, name, getattr(cb, name))
@@ -646,6 +701,140 @@ class WorkspaceFolderTest(unittest.TestCase):
         self.assertEqual(cb.workspace_folder("/home/u/tmp/repo"), "/workspaces/repo")
 
 
+class ResolvePathTest(unittest.TestCase):
+    def test_joins_a_relative_path_onto_the_base(self):
+        self.assertEqual(cb.resolve_path("../data", "/home/u/git/repo"), "/home/u/git/data")
+
+    def test_keeps_an_absolute_path(self):
+        self.assertEqual(cb.resolve_path("/srv/x/", "/home/u/git/repo"), "/srv/x")
+
+    def test_expands_the_home_directory(self):
+        self.assertEqual(
+            cb.resolve_path("~/data", "/w"), os.path.join(os.path.expanduser("~"), "data")
+        )
+
+
+class ParseMountTest(unittest.TestCase):
+    """SRC[:DST][:ro|rw], with DST defaulting to the way the workspace itself is
+    placed: /workspaces/<slug of the basename>."""
+
+    WS = "/home/u/git/repo"
+
+    def test_source_only_lands_next_to_the_workspace(self):
+        self.assertEqual(
+            cb.parse_mount("/home/u/git/My_Lib", self.WS),
+            ("/home/u/git/My_Lib", "/workspaces/my-lib", False),
+        )
+
+    def test_relative_source_is_resolved_against_the_workspace(self):
+        self.assertEqual(cb.parse_mount("../lib", self.WS)[0], "/home/u/git/lib")
+
+    def test_explicit_target(self):
+        self.assertEqual(
+            cb.parse_mount("/data:/mnt/data", self.WS), ("/data", "/mnt/data", False)
+        )
+
+    def test_read_only_without_target(self):
+        self.assertEqual(
+            cb.parse_mount("/data:ro", self.WS), ("/data", "/workspaces/data", True)
+        )
+
+    def test_read_only_with_target(self):
+        self.assertEqual(
+            cb.parse_mount("/data:/mnt/d:ro", self.WS), ("/data", "/mnt/d", True)
+        )
+
+    def test_rw_is_accepted_and_is_the_default(self):
+        self.assertEqual(cb.parse_mount("/data:rw", self.WS)[2], False)
+
+    def test_refuses_a_relative_target(self):
+        with self.assertRaises(cb.UsageError):
+            cb.parse_mount("/data:mnt", self.WS)
+
+    def test_refuses_an_empty_target(self):
+        with self.assertRaises(cb.UsageError):
+            cb.parse_mount("/data:", self.WS)
+
+    def test_refuses_an_empty_source(self):
+        with self.assertRaises(cb.UsageError):
+            cb.parse_mount(":/mnt", self.WS)
+
+    def test_refuses_too_many_parts(self):
+        with self.assertRaises(cb.UsageError):
+            cb.parse_mount("/a:/b:/c", self.WS)
+
+    def test_refuses_a_comma(self):
+        # docker reads --mount as CSV.
+        with self.assertRaises(cb.UsageError):
+            cb.parse_mount("/a,b", self.WS)
+
+    def test_round_trips_through_format(self):
+        mount = ("/data", "/mnt/d", True)
+        self.assertEqual(cb.parse_mount(cb.format_mount(mount), "/"), mount)
+
+
+class MountValueTest(unittest.TestCase):
+    def test_bind(self):
+        self.assertEqual(
+            cb.mount_value(("/a", "/b", False)), "type=bind,source=/a,target=/b"
+        )
+
+    def test_read_only(self):
+        self.assertEqual(
+            cb.mount_value(("/a", "/b", True)), "type=bind,source=/a,target=/b,readonly"
+        )
+
+
+class MergeMountsTest(unittest.TestCase):
+    def test_keeps_both_lists(self):
+        merged = cb.merge_mounts([("/a", "/x", False)], [("/b", "/y", False)])
+        self.assertEqual(merged, [("/a", "/x", False), ("/b", "/y", False)])
+
+    def test_a_run_mount_replaces_a_persistent_one_on_the_same_target(self):
+        merged = cb.merge_mounts([("/a", "/x", False)], [("/a", "/x", True)])
+        self.assertEqual(merged, [("/a", "/x", True)])
+
+    def test_two_run_mounts_on_one_target_are_refused(self):
+        with self.assertRaises(cb.UsageError):
+            cb.merge_mounts([], [("/a", "/x", False), ("/b", "/x", False)])
+
+
+class CheckTargetsTest(unittest.TestCase):
+    WS = "/home/u/git/repo"
+
+    def check(self, target):
+        cb.check_targets([("/src", target, False)], cb.fixed_targets(self.WS))
+
+    def test_accepts_a_sibling_of_the_workspace(self):
+        self.check("/workspaces/other")
+
+    def test_refuses_the_workspace_folder(self):
+        with self.assertRaises(cb.UsageError):
+            self.check("/workspaces/repo")
+
+    def test_refuses_a_path_inside_a_fixed_target(self):
+        with self.assertRaises(cb.UsageError):
+            self.check("/home/node/.claude/skills")
+
+    def test_refuses_a_path_above_a_fixed_target(self):
+        # Mounting over /home/node would hide ~/.claude and the browser cache.
+        with self.assertRaises(cb.UsageError):
+            self.check("/home/node")
+
+    def test_a_shared_prefix_is_not_nesting(self):
+        self.check("/commandhistory-extra")
+
+
+class RequireSourcesTest(unittest.TestCase):
+    def test_accepts_an_existing_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cb.require_sources([(tmp, "/x", False)])
+
+    def test_refuses_a_missing_source(self):
+        with self.assertRaises(cb.CbError):
+            cb.require_sources([("/does/not/exist", "/x", False)])
+
+
 class HistoryVolumeTest(unittest.TestCase):
     def test_is_named_after_the_path_hash(self):
         self.assertEqual(cb.history_volume("/w"), "cb-history-" + cb.path_hash("/w"))
@@ -692,62 +881,72 @@ class ContainerEnvTest(unittest.TestCase):
         self.assertNotIn("TERM_PROGRAM", cb.container_env(docker=False))
 
 
-class CreateArgvTest(unittest.TestCase):
-    """What devcontainer.json used to say, now said in docker's own flags."""
+class RunArgvTest(unittest.TestCase):
+    """One box per run: docker run --rm, the command in the foreground."""
 
     def setUp(self):
         self.workspace = "/home/u/git/repo"
-        self.argv = cb.create_argv(self.workspace, docker=False)
+        self.argv = cb.run_argv(
+            self.workspace, docker=False, mounts=[], command=["claude", "-c"],
+            tty=False, suffix="abcd",
+        )
 
-    def test_runs_detached(self):
-        self.assertEqual(self.argv[:3], ["docker", "run", "--detach"])
+    def test_removes_the_container_when_the_command_ends(self):
+        self.assertEqual(self.argv[:4], ["docker", "run", "--rm", "--init"])
 
-    def test_names_the_container_after_the_box(self):
-        name = cb.container_name(self.workspace)
-        self.assertEqual(flag_values(self.argv, "--name"), [name])
+    def test_keeps_stdin_open(self):
+        self.assertIn("--interactive", self.argv)
 
-    def test_gives_the_box_its_name_as_a_hostname(self):
-        # Otherwise the prompt inside the box shows a random hex id.
+    def test_names_the_container_after_the_box_plus_a_suffix(self):
+        self.assertEqual(
+            flag_values(self.argv, "--name"), [cb.container_name(self.workspace) + "-abcd"]
+        )
+
+    def test_two_runs_get_two_names(self):
+        a = cb.run_argv(self.workspace, False, [], ["zsh"], tty=False)
+        b = cb.run_argv(self.workspace, False, [], ["zsh"], tty=False)
+        self.assertNotEqual(flag_values(a, "--name"), flag_values(b, "--name"))
+
+    def test_hostname_has_no_suffix(self):
+        # The prompt stays the same from run to run.
         self.assertEqual(
             flag_values(self.argv, "--hostname"), [cb.container_name(self.workspace)]
         )
 
-    def test_marks_the_container_as_a_box(self):
-        self.assertIn(cb.BOX_LABEL + "=1", flag_values(self.argv, "--label"))
+    def test_labels(self):
+        labels = flag_values(self.argv, "--label")
+        self.assertIn("{}={}".format(cb.BOX_LABEL, cb.BOX_GENERATION), labels)
+        self.assertIn("{}={}".format(cb.FOLDER_LABEL, self.workspace), labels)
 
-    def test_labels_the_folder_it_was_started_from(self):
-        # This is how every later cb invocation finds the box again.
-        self.assertIn(
-            "{}={}".format(cb.FOLDER_LABEL, self.workspace),
-            flag_values(self.argv, "--label"),
-        )
-
-    def test_mounts_the_checkout_at_the_workspace_folder(self):
+    def test_mounts_checkout_claude_dir_history_and_browsers(self):
+        mounts = flag_values(self.argv, "--mount")
         self.assertIn(
             "type=bind,source={},target={}".format(
                 self.workspace, cb.workspace_folder(self.workspace)
             ),
-            flag_values(self.argv, "--mount"),
+            mounts,
         )
-
-    def test_mounts_the_hosts_claude_directory(self):
         self.assertIn(
             "type=bind,source={},target={}".format(cb.HOST_CLAUDE_DIR, cb.BOX_CLAUDE_DIR),
-            flag_values(self.argv, "--mount"),
+            mounts,
         )
-
-    def test_mounts_the_shell_history_as_a_volume(self):
         self.assertIn(
             "type=volume,source={},target=/commandhistory".format(
                 cb.history_volume(self.workspace)
             ),
-            flag_values(self.argv, "--mount"),
+            mounts,
         )
-
-    def test_mounts_the_shared_browser_cache(self):
         self.assertIn(
             "type=volume,source=cb-playwright,target=/home/node/.cache/ms-playwright",
-            flag_values(self.argv, "--mount"),
+            mounts,
+        )
+
+    def test_adds_extra_mounts(self):
+        argv = cb.run_argv(
+            self.workspace, False, [("/data", "/mnt/d", True)], ["zsh"], tty=False
+        )
+        self.assertIn(
+            "type=bind,source=/data,target=/mnt/d,readonly", flag_values(argv, "--mount")
         )
 
     def test_starts_in_the_workspace_folder(self):
@@ -758,24 +957,176 @@ class CreateArgvTest(unittest.TestCase):
     def test_renders_the_environment(self):
         self.assertIn("CB_DIND=false", flag_values(self.argv, "--env"))
 
-    def test_stays_unprivileged_without_docker(self):
+    def test_privileged_only_with_docker(self):
         self.assertNotIn("--privileged", self.argv)
+        self.assertIn(
+            "--privileged", cb.run_argv(self.workspace, True, [], ["zsh"], tty=False)
+        )
 
-    def test_is_privileged_with_docker(self):
-        # dockerd inside the box cannot mount, write cgroups or program iptables
-        # without it.
-        self.assertIn("--privileged", cb.create_argv(self.workspace, docker=True))
+    def test_tty_and_term_when_there_is_a_terminal(self):
+        self.addCleanup(os.environ.pop, "TERM", None)
+        os.environ["TERM"] = "xterm-ghostty"
+        argv = cb.run_argv(self.workspace, False, [], ["zsh"], tty=True)
+        self.assertIn("--tty", argv)
+        self.assertIn("TERM=xterm-ghostty", flag_values(argv, "--env"))
 
-    def test_refuses_a_path_docker_cannot_be_told_about(self):
-        # docker reads a --mount value as CSV, so a comma in the path would split
-        # the field and fail with something unrelated to the cause.
+    def test_no_tty_without_a_terminal(self):
+        self.assertNotIn("--tty", self.argv)
+
+    def test_refuses_a_workspace_path_with_a_comma(self):
         with self.assertRaises(cb.UsageError):
-            cb.create_argv("/home/u/git/a,b", docker=False)
+            cb.run_argv("/home/u/git/a,b", False, [], ["zsh"], tty=False)
 
-    def test_ends_with_the_image_and_an_idle_command(self):
-        # Nothing in the image stays in the foreground, so the container needs a
-        # process that does; claude then arrives by `docker exec`.
-        self.assertEqual(self.argv[-3:], [cb.CB_IMAGE, "sleep", "infinity"])
+    def test_ends_with_the_image_the_entrypoint_and_the_command(self):
+        self.assertEqual(self.argv[-4:], [cb.CB_IMAGE, cb.CB_ENTRY, "claude", "-c"])
+
+
+class CmdRunTest(unittest.TestCase):
+    """The run path end to end, with the side effects recorded."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = os.path.join(self.tmp.name, "repo")
+        os.mkdir(self.workspace)
+        self.replaced = []
+        settings = os.path.join(self.tmp.name, "settings.json")
+        for name, value in (
+            ("current_workspace", lambda: self.workspace),
+            ("settings_path", lambda path: settings),
+            ("roots", lambda: [self.tmp.name]),
+            ("ensure_image", lambda: None),
+            ("check_docker_feature", lambda docker: None),
+            ("ensure_claude_dir", lambda: None),
+            ("ensure_history_volume", lambda workspace: None),
+            ("replace_process", self.replaced.append),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+
+    def flags(self, **overrides):
+        flags, _ = cb.extract_flags([])
+        flags.update(overrides)
+        return flags
+
+    def test_run_starts_claude_with_its_arguments(self):
+        cb.cmd_run(self.flags(), ["--continue"])
+        self.assertEqual(self.replaced[0][-2:], ["claude", "--continue"])
+
+    def test_shell_starts_zsh(self):
+        cb.cmd_shell(self.flags(), [])
+        self.assertEqual(self.replaced[0][-1], "zsh")
+
+    def test_shell_rejects_arguments(self):
+        with self.assertRaises(cb.UsageError):
+            cb.cmd_shell(self.flags(), ["ls"])
+
+    def test_per_run_mount_is_added(self):
+        cb.cmd_run(self.flags(volumes=[self.tmp.name + ":/mnt/t"]), [])
+        self.assertIn(
+            "type=bind,source={},target=/mnt/t".format(self.tmp.name),
+            flag_values(self.replaced[0], "--mount"),
+        )
+
+    def test_missing_mount_source_stops_before_docker(self):
+        with self.assertRaises(cb.CbError):
+            cb.cmd_run(self.flags(volumes=["/does/not/exist"]), [])
+        self.assertEqual(self.replaced, [])
+
+    def test_gate_applies_on_every_run(self):
+        cb.roots = lambda: ["/nowhere"]
+        with self.assertRaises(cb.UsageError):
+            cb.cmd_run(self.flags(), [])
+
+
+class RemovedSubcommandTest(unittest.TestCase):
+    """Habit types `cb down`. That must not become a claude prompt."""
+
+    def test_removed_words_are_refused_with_a_pointer(self):
+        for word in ("up", "down", "recreate"):
+            with self.assertRaises(cb.UsageError):
+                cb.main([word])
+
+    def test_double_dash_still_reaches_claude(self):
+        name, rest = cb.pick_subcommand(["--", "down"])
+        self.assertEqual(name, "run")
+
+
+class MountCommandTest(unittest.TestCase):
+    """Remembered mounts round-trip through the per-workspace settings file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = os.path.join(self.tmp.name, "repo")
+        self.lib = os.path.join(self.tmp.name, "lib")
+        os.mkdir(self.workspace)
+        os.mkdir(self.lib)
+        self.settings = os.path.join(self.tmp.name, "settings.json")
+        for name, value in (
+            ("current_workspace", lambda: self.workspace),
+            ("settings_path", lambda path: self.settings),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+
+    def mount(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cb.cmd_mount({"yes": False}, list(args))
+        return out.getvalue()
+
+    def stored(self):
+        return cb.stored_mounts(cb.load_settings(self.settings))
+
+    def test_add_stores_the_resolved_spec(self):
+        self.mount("add", "../lib:ro")
+        self.assertEqual(self.stored(), [(self.lib, "/workspaces/lib", True)])
+
+    def test_ls_lists_them(self):
+        self.mount("add", "../lib")
+        self.assertIn("/workspaces/lib", self.mount("ls"))
+
+    def test_rm_by_source(self):
+        self.mount("add", "../lib")
+        self.mount("rm", "../lib")
+        self.assertEqual(self.stored(), [])
+
+    def test_rm_by_target(self):
+        self.mount("add", "../lib")
+        self.mount("rm", "/workspaces/lib")
+        self.assertEqual(self.stored(), [])
+
+    def test_rm_unknown_is_an_error(self):
+        with self.assertRaises(cb.CbError):
+            self.mount("rm", "/nothing")
+
+    def test_add_refuses_a_missing_source_and_stores_nothing(self):
+        with self.assertRaises(cb.CbError):
+            self.mount("add", "../nope")
+        self.assertEqual(self.stored(), [])
+
+    def test_add_refuses_a_taken_target(self):
+        self.mount("add", "../lib")
+        with self.assertRaises(cb.UsageError):
+            self.mount("add", self.tmp.name + ":/workspaces/lib")
+
+    def test_add_refuses_a_fixed_target(self):
+        with self.assertRaises(cb.UsageError):
+            self.mount("add", "../lib:/home/node/.claude")
+
+    def test_add_keeps_other_settings(self):
+        cb.save_settings(self.settings, {"docker": True}, self.workspace)
+        self.mount("add", "../lib")
+        self.assertIs(cb.load_settings(self.settings)["docker"], True)
+
+    def test_unknown_action(self):
+        with self.assertRaises(cb.UsageError):
+            self.mount("purge")
+
+    def test_config_refuses_to_set_mounts(self):
+        with self.assertRaises(cb.UsageError):
+            cb.set_setting("mounts", "true")
 
 
 class VolumePruneTest(unittest.TestCase):
@@ -784,7 +1135,14 @@ class VolumePruneTest(unittest.TestCase):
     def setUp(self):
         self.commands = []
         self.volumes = {"cb-playwright"}
-        self.dangling = "cb-history-aaaa\nnot-cb-history-bbbb\n"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dangling = (
+            "cb-history-aaaa\t/gone/checkout\n"
+            "cb-history-bbbb\t{}\n"
+            "cb-history-cccc\t\n"
+            "not-cb-history-dddd\t/gone\n"
+        ).format(self.tmp.name)
 
         def record(argv, quiet=False, check=True):
             self.commands.append(list(argv))
@@ -814,9 +1172,26 @@ class VolumePruneTest(unittest.TestCase):
         self.prune("playwright")
         self.assertFalse(any(argv[:3] == ["docker", "volume", "rm"] for argv in self.commands))
 
-    def test_all_also_removes_orphaned_history(self):
+    def test_all_removes_history_of_gone_checkouts_only(self):
         self.prune("all")
         self.assertIn(["docker", "volume", "rm", "cb-history-aaaa"], self.commands)
+
+    def test_all_keeps_history_of_an_existing_checkout(self):
+        # Every history volume is dangling between runs now.
+        self.prune("all")
+        removed = [a for a in self.commands if a[:3] == ["docker", "volume", "rm"]]
+        self.assertFalse(any("cb-history-bbbb" in argv for argv in removed))
+
+    def test_all_keeps_unlabelled_history(self):
+        self.prune("all")
+        removed = [a for a in self.commands if a[:3] == ["docker", "volume", "rm"]]
+        self.assertFalse(any("cb-history-cccc" in argv for argv in removed))
+
+    def test_all_says_what_it_skipped(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cb.cmd_volume({"yes": True}, ["prune", "all"])
+        self.assertIn("skipped (no label): cb-history-cccc", out.getvalue())
 
     def test_does_nothing_when_there_is_nothing(self):
         self.volumes = set()
@@ -857,17 +1232,6 @@ class ExecArgvTest(unittest.TestCase):
         self.assertNotIn("--tty", argv)
         self.assertIn("--interactive", argv)
 
-    def test_can_drop_stdin_entirely(self):
-        argv = cb.exec_argv("cb-box", ["true"], tty=False, interactive=False)
-        self.assertNotIn("--interactive", argv)
-
-    def test_runs_as_the_user_it_is_given(self):
-        argv = cb.exec_argv("cb-box", ["true"], tty=False, user="root")
-        self.assertEqual(flag_values(argv, "--user"), ["root"])
-
-    def test_leaves_the_user_to_the_image_by_default(self):
-        self.assertEqual(flag_values(cb.exec_argv("cb-box", ["true"], tty=False), "--user"), [])
-
     def test_forwards_the_terminal_type(self):
         # docker exec otherwise hands the command a bare TERM=xterm, which costs
         # tmux and vim inside the box their colours.
@@ -890,42 +1254,155 @@ class ExecArgvTest(unittest.TestCase):
         self.assertEqual(flag_values(argv, "--env"), [])
 
 
-class PostStartArgvTest(unittest.TestCase):
-    """What devcontainer.json's postStartCommand did, on every start."""
+class EnsureImageTest(unittest.TestCase):
+    """An image from before cb-entry would fail every run with a bare docker
+    "no such file" after cb has already exec'd away, so it counts as missing."""
 
-    def test_runs_cb_dockerd_as_root(self):
-        argv = cb.post_start_argv("cb-box")
-        self.assertEqual(flag_values(argv, "--user"), ["root"])
-        self.assertEqual(argv[-1], cb.CB_DOCKERD)
+    def setUp(self):
+        self.built = []
+        self.label = "1"
+        self.exists = True
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        state = Path(self.tmp.name) / "image.json"
+        state.write_text('{"rust": false, "versions": {"go": "1.26.5"}}')
+        for name, value in (
+            ("image_state_path", lambda: str(state)),
+            ("image_exists", lambda: self.exists),
+            ("image_label", lambda name: self.label if name == cb.ENTRY_LABEL else None),
+            ("latest_versions", lambda: {"go": "9.9.9"}),
+            ("build_image", lambda features, versions, no_cache=False: self.built.append(versions)),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+
+    def ensure(self):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cb.ensure_image()
+
+    def test_a_current_image_is_left_alone(self):
+        self.ensure()
+        self.assertEqual(self.built, [])
+
+    def test_an_image_without_cb_entry_is_rebuilt_at_its_own_versions(self):
+        # Like update-claude: only the layers from cb-entry down change.
+        self.label = None
+        self.ensure()
+        self.assertEqual(self.built, [{"go": "1.26.5"}])
+
+    def test_a_missing_image_is_built_at_the_newest_versions(self):
+        self.exists = False
+        self.label = None
+        self.ensure()
+        self.assertEqual(self.built, [{"go": "9.9.9"}])
+
+
+class RunningBoxesTest(unittest.TestCase):
+    """Boxes from the long-lived lifecycle carry cb.box=1 and idle forever. They
+    must not be what `cb exec` picks or `cb ls` lists."""
+
+    def test_asks_only_for_this_generation(self):
+        asked = []
+
+        def fake_capture(argv):
+            asked.append(argv)
+            return ""
+
+        self.addCleanup(setattr, cb, "capture", cb.capture)
+        cb.capture = fake_capture
+        cb.running_boxes()
+        self.assertIn(
+            "label={}={}".format(cb.BOX_LABEL, cb.BOX_GENERATION), asked[0]
+        )
+        self.assertNotEqual(cb.BOX_GENERATION, "1")
 
 
 class ParsePsRowsTest(unittest.TestCase):
-    """Boxes made by the devcontainer CLI carry its label and no cb label, so
-    one listing has to read both."""
+    def test_reads_name_started_and_folder(self):
+        rows = cb.parse_ps_rows("cb-a-1-abcd\t5 minutes ago\t/home/u/git/a\n")
+        self.assertEqual(rows, [("cb-a-1-abcd", "5 minutes ago", "/home/u/git/a")])
 
-    def test_reads_cbs_own_folder_label(self):
-        rows = cb.parse_ps_rows("cb-a\tUp 2 hours\t/home/u/git/a\t\n")
-        self.assertEqual(rows, [("cb-a", "Up 2 hours", "/home/u/git/a")])
-
-    def test_falls_back_to_the_devcontainer_label(self):
-        rows = cb.parse_ps_rows("vsc-x\tExited (0)\t\t/home/u/git/x\n")
-        self.assertEqual(rows[0][2], "/home/u/git/x")
-
-    def test_says_nothing_rather_than_blank_when_neither_is_set(self):
-        rows = cb.parse_ps_rows("other\tUp\t\t\n")
-        self.assertEqual(rows[0][2], "-")
+    def test_says_nothing_rather_than_blank_without_a_folder(self):
+        self.assertEqual(cb.parse_ps_rows("x\tnow\t\n")[0][2], "-")
 
     def test_skips_blank_lines(self):
         self.assertEqual(cb.parse_ps_rows("\n\n"), [])
 
-    def test_reads_nothing_from_nothing(self):
-        self.assertEqual(cb.parse_ps_rows(""), [])
+
+class PickBoxTest(unittest.TestCase):
+    """Which running box `cb exec` goes into."""
+
+    ROWS = [
+        ("cb-a-11111111-abcd", "1m", "/home/u/git/a"),
+        ("cb-a-11111111-ef01", "2m", "/home/u/git/a"),
+        ("cb-b-22222222-1234", "3m", "/home/u/git/b"),
+        ("cb-c-33333333-abcd", "4m", "/home/u/git/c"),
+    ]
+
+    def test_the_only_box_of_the_workspace(self):
+        self.assertEqual(cb.pick_box(self.ROWS, "/home/u/git/b", None), "cb-b-22222222-1234")
+
+    def test_no_box_for_the_workspace(self):
+        with self.assertRaises(cb.CbError):
+            cb.pick_box(self.ROWS, "/home/u/git/z", None)
+
+    def test_several_boxes_name_them(self):
+        with self.assertRaises(cb.CbError) as caught:
+            cb.pick_box(self.ROWS, "/home/u/git/a", None)
+        self.assertIn("cb-a-11111111-ef01", str(caught.exception))
+
+    def test_by_full_name(self):
+        self.assertEqual(
+            cb.pick_box(self.ROWS, "/x", "cb-a-11111111-ef01"), "cb-a-11111111-ef01"
+        )
+
+    def test_by_suffix(self):
+        self.assertEqual(cb.pick_box(self.ROWS, "/x", "ef01"), "cb-a-11111111-ef01")
+
+    def test_ambiguous_suffix_is_refused(self):
+        with self.assertRaises(cb.CbError):
+            cb.pick_box(self.ROWS, "/x", "abcd")
+
+    def test_unknown_name(self):
+        with self.assertRaises(cb.CbError):
+            cb.pick_box(self.ROWS, "/x", "9999")
+
+
+class SplitExecArgsTest(unittest.TestCase):
+    def test_plain_command(self):
+        self.assertEqual(cb.split_exec_args(["ls", "-n"]), (None, ["ls", "-n"]))
+
+    def test_leading_name(self):
+        self.assertEqual(cb.split_exec_args(["-n", "abcd", "zsh"]), ("abcd", ["zsh"]))
+
+    def test_needs_a_command(self):
+        with self.assertRaises(cb.UsageError):
+            cb.split_exec_args(["-n", "abcd"])
+
+    def test_needs_a_name_after_n(self):
+        with self.assertRaises(cb.UsageError):
+            cb.split_exec_args(["-n"])
+
+
+class LsTargetTest(unittest.TestCase):
+    def test_no_argument_lists_everything(self):
+        self.assertIsNone(cb.ls_folder([], "/home/u/git/a"))
+
+    def test_dot_is_the_workspace(self):
+        self.assertEqual(cb.ls_folder(["."], "/home/u/git/a"), "/home/u/git/a")
+
+    def test_relative_is_logical(self):
+        self.assertEqual(cb.ls_folder(["../b"], "/home/u/git/a"), "/home/u/git/b")
+
+    def test_more_than_one_is_refused(self):
+        with self.assertRaises(cb.UsageError):
+            cb.ls_folder([".", ".."], "/home/u/git/a")
 
 
 class FormatTableTest(unittest.TestCase):
     def test_writes_a_header(self):
         lines = cb.format_table([]).splitlines()
-        self.assertEqual(lines[0].split(), ["NAME", "STATUS", "FOLDER"])
+        self.assertEqual(lines[0].split(), ["NAME", "STARTED", "FOLDER"])
 
     def test_keeps_the_header_when_there_is_nothing_to_list(self):
         self.assertEqual(len(cb.format_table([]).splitlines()), 1)
@@ -934,128 +1411,6 @@ class FormatTableTest(unittest.TestCase):
         table = cb.format_table([("short", "Up", "/a"), ("much-longer", "Up", "/b")])
         first, second = table.splitlines()[1:]
         self.assertEqual(first.index("Up"), second.index("Up"))
-
-
-class StartBoxTest(unittest.TestCase):
-    """The create / start / post-start decision the devcontainer CLI used to
-    make, asserted as the sequence of docker commands it issues.
-
-    No daemon is needed for that: the question is which command runs, not what
-    it does. run() and box_for() are the seam — the commands are recorded rather
-    than executed, and everything that builds them is the real code.
-    """
-
-    def setUp(self):
-        self.commands = []
-        self.box = None
-
-        def record(argv, quiet=False, check=True):
-            self.commands.append(list(argv))
-            return 0
-
-        for name, value in (
-            ("run", record),
-            ("docker_remove", lambda names: self.commands.append(["docker", "rm", "-f"] + names)),
-            ("ensure_claude_dir", lambda: None),
-        ):
-            self.addCleanup(setattr, cb, name, getattr(cb, name))
-            setattr(cb, name, value)
-
-    def verbs(self):
-        """The docker subcommand of each command issued, in order."""
-        return [argv[1] for argv in self.commands]
-
-    def test_creates_a_box_that_does_not_exist_yet(self):
-        name = cb.start_box("/home/u/git/repo", docker=False, box=None)
-        self.assertEqual(self.verbs(), ["run", "exec"])
-        self.assertEqual(name, cb.container_name("/home/u/git/repo"))
-
-    def test_starts_a_box_that_already_exists(self):
-        box = cb.container_name("/home/u/git/repo")
-        cb.start_box("/home/u/git/repo", docker=False, box=box)
-        self.assertEqual(self.verbs(), ["start", "exec"])
-
-    def test_never_creates_a_second_container_for_one_checkout(self):
-        box = cb.container_name("/home/u/git/repo")
-        cb.start_box("/home/u/git/repo", docker=False, box=box)
-        self.assertNotIn("run", self.verbs())
-
-    def test_replaces_the_container_when_asked_to_recreate(self):
-        box = cb.container_name("/home/u/git/repo")
-        cb.start_box("/home/u/git/repo", docker=False, box=box, recreate=True)
-        self.assertEqual(self.verbs(), ["rm", "run", "exec"])
-
-    def test_adopts_a_box_made_by_the_devcontainer_version_of_cb(self):
-        # Its name is the CLI's, not container_name()'s. Creating alongside it
-        # would collide on the name cb would pick; starting it is the migration.
-        name = cb.start_box("/home/u/git/repo", docker=False, box="vsc-repo-9f1c3a")
-        self.assertEqual(name, "vsc-repo-9f1c3a")
-        self.assertEqual(self.commands[0], ["docker", "start", "vsc-repo-9f1c3a"])
-
-    def test_runs_cb_dockerd_against_the_box_it_started(self):
-        cb.start_box("/home/u/git/repo", docker=True, box="vsc-repo-9f1c3a")
-        self.assertEqual(self.commands[-1][-2:], ["vsc-repo-9f1c3a", cb.CB_DOCKERD])
-
-
-class LegacyFiltersTest(unittest.TestCase):
-    """A box made by the devcontainer version of cb has to stay reachable, but
-    VS Code stamps devcontainer.local_folder with the same value for a repo's
-    own .devcontainer/ — and adopting that container would exec claude in
-    someone else's box, or `cb recreate` would remove it."""
-
-    def test_asks_for_cbs_own_config(self):
-        self.assertIn("label=" + cb.LEGACY_CONFIG_LABEL + "=" + cb.LEGACY_CONFIG,
-                      cb.legacy_filters())
-
-    def test_narrows_to_one_folder_when_given_one(self):
-        filters = cb.legacy_filters("/home/u/git/repo")
-        # Two --filter terms in one query are an AND, which is what excludes a
-        # foreign devcontainer for the same folder.
-        self.assertIn("label={}=/home/u/git/repo".format(cb.DC_FOLDER_LABEL), filters)
-        self.assertIn("label=" + cb.LEGACY_CONFIG_LABEL + "=" + cb.LEGACY_CONFIG, filters)
-
-    def test_leaves_the_folder_open_without_one(self):
-        self.assertNotIn(cb.DC_FOLDER_LABEL, " ".join(cb.legacy_filters()))
-
-
-class ScopeTest(unittest.TestCase):
-    """The three filterset lists are the whole migration contract: which
-    containers cb calls its own, and which it merely knows about."""
-
-    def terms(self, filtersets):
-        return " ".join(term for filters in filtersets for term in filters)
-
-    def test_a_cb_box_is_either_generation(self):
-        terms = self.terms(cb.BOX_SCOPE)
-        self.assertIn("label={}".format(cb.BOX_LABEL), terms)
-        self.assertIn("label={}={}".format(cb.LEGACY_CONFIG_LABEL, cb.LEGACY_CONFIG), terms)
-
-    def test_a_cb_box_is_never_just_any_devcontainer(self):
-        # `cb down --all` must not reach VS Code's containers without asking.
-        self.assertNotIn("label=" + cb.DC_FOLDER_LABEL, self.terms(cb.BOX_SCOPE))
-
-    def test_any_widens_to_every_devcontainer(self):
-        self.assertIn("label=" + cb.DC_FOLDER_LABEL, self.terms(cb.ANY_SCOPE))
-
-    def test_a_box_for_one_folder_is_looked_up_under_both_generations(self):
-        terms = self.terms(cb.box_filters("/home/u/git/repo"))
-        self.assertIn("label={}=/home/u/git/repo".format(cb.FOLDER_LABEL), terms)
-        self.assertIn("label={}=/home/u/git/repo".format(cb.DC_FOLDER_LABEL), terms)
-        self.assertIn("label={}={}".format(cb.LEGACY_CONFIG_LABEL, cb.LEGACY_CONFIG), terms)
-
-
-class MergeRowsTest(unittest.TestCase):
-    """`--any` is the union of two label queries, and a container carrying both
-    labels is answered by both. Listing it twice reads as two boxes; removing it
-    twice is an error."""
-
-    def test_keeps_one_row_per_container(self):
-        rows = cb.merge_rows([[("cb-a", "Up", "/a")], [("cb-a", "Up", "/a")]])
-        self.assertEqual(rows, [("cb-a", "Up", "/a")])
-
-    def test_keeps_the_order_of_the_first_answer(self):
-        rows = cb.merge_rows([[("b", "Up", "/b")], [("a", "Up", "/a")]])
-        self.assertEqual([row[0] for row in rows], ["b", "a"])
 
 
 if __name__ == "__main__":

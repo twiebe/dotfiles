@@ -230,9 +230,9 @@ ARG USERNAME=node
 # sudo used to be a no-op: no sudoers entry, and node has no password.
 # Either do it properly or leave the package out.
 #
-# The env_keep line is for reaching cb-dockerd by hand: sudo drops the
-# environment it would otherwise read CB_DIND from. cb itself runs it as root
-# through `docker exec`, where the container's own environment carries CB_DIND.
+# The env_keep line keeps CB_DIND across sudo, which would otherwise drop the
+# environment cb-dockerd reads it from — both for cb-entry, which starts it at
+# the beginning of every box, and for reaching it by hand.
 RUN printf 'Defaults env_keep += "CB_DIND"\n%s ALL=(ALL) NOPASSWD:ALL\n' "$USERNAME" > /etc/sudoers.d/$USERNAME \
   && chmod 0440 /etc/sudoers.d/$USERNAME
 
@@ -316,8 +316,8 @@ RUN if [ "$WITH_SQLX" = 1 ] && [ "$WITH_RUST" = 1 ]; then \
 #
 # One directory per box rather than per project, which is what a box already is:
 # the workspace path cb mounts at is unique per repo, so a box holds one
-# checkout. Not a volume, deliberately: this is rebuildable state, and
-# `cb recreate` is supposed to hand back a clean slate.
+# checkout. Not a volume, deliberately: this is rebuildable state, and every
+# run starts from a clean slate.
 #
 # Must stay BELOW the `cargo install` above, otherwise that build's
 # intermediates land here and ship inside the image.
@@ -407,19 +407,21 @@ RUN if [ "$WITH_KUBERNETES" = 1 ]; then \
       && sudo rm -rf /var/lib/apt/lists/*; \
     fi
 
-# The only COPY from the build context, and the reason it sits this low: a COPY
-# is cached on the content of what it copies, so every edit to this script
-# invalidates the layer and everything below it. Further up — where it used to
-# be — "below it" meant the Rust toolchain, the Go copy, the from-source sqlx-cli
-# build and the Playwright apt layer, so fixing a comment in a 90-line shell
-# script cost a multi-GB rebuild. Nothing between here and the top needs the
-# file: it is read at container start, never during the build.
+# The only COPYs from the build context, and the reason they sit this low: a
+# COPY is cached on the content of what it copies, so every edit to one of these
+# scripts invalidates the layer and everything below it. Further up — where
+# cb-dockerd used to be — "below it" meant the Rust toolchain, the Go copy, the
+# from-source sqlx-cli build and the Playwright apt layer, so fixing a comment in
+# a 90-line shell script cost a multi-GB rebuild. Nothing between here and the
+# top needs either file: both are read at container start, never during the
+# build. cb-entry is what cb runs as every box's command; it starts cb-dockerd.
 COPY --chmod=0755 cb-dockerd /usr/local/bin/cb-dockerd
+COPY --chmod=0755 cb-entry /usr/local/bin/cb-entry
 
 # Last layer on purpose — it is the one that changes most often. cb feeds a
 # concrete version in via --build-arg, so a new release
-# invalidates this layer and nothing above it. That is what lets `cb recreate`
-# pick up a new claude-code without --no-cache.
+# invalidates this layer and nothing above it. That is what lets the next
+# `cb run` pick up a new claude-code without --no-cache.
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
@@ -444,3 +446,8 @@ ARG GO_VERSION
 ARG KUBECTL_VERSION
 ARG TOFU_VERSION
 LABEL cb.versions="claude=${CLAUDE_CODE_VERSION},go=${GO_VERSION},kubectl=${KUBECTL_VERSION},tofu=${TOFU_VERSION},uv=${UV_VERSION}"
+
+# cb runs every box as `cb-entry …`. An image without it would fail each run
+# after cb has handed over to docker, so cb checks for this label first and
+# rebuilds an image that lacks it.
+LABEL cb.entry=1
