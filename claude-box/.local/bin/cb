@@ -13,8 +13,14 @@ import urllib.request
 
 CB_DIR = os.path.expanduser("~/.config/claude-box")
 
-# One tag for every box. The Dockerfile in CB_DIR produces it.
+# One tag for every box: BASE_IMAGE plus claude-code, built from
+# CLAUDE_DOCKERFILE. The Dockerfile in CB_DIR produces BASE_IMAGE — everything
+# else, the slow part. Two images rather than two stages of one, so that
+# update-claude can never rebuild anything of the base: it does not build it, it
+# starts from it.
 CB_IMAGE = "claude-box:latest"
+BASE_IMAGE = "claude-box:base"
+CLAUDE_DOCKERFILE = os.path.join(CB_DIR, "Dockerfile.claude")
 
 CLAUDE_PACKAGE = "@anthropic-ai/claude-code"
 
@@ -376,7 +382,7 @@ def extract_flags(args):
 # nothing to resolve and cannot leave two boxes fighting over a tag.
 #
 # All default to on, which is what keeps a bare `docker build` in
-# .config/claude-box producing the same image cb builds — the Dockerfile has to
+# .config/claude-box producing the same base cb builds — the Dockerfile has to
 # stand on its own, without cb's --build-arg list in front of it.
 # ---------------------------------------------------------------------------
 
@@ -763,13 +769,12 @@ TOOLCHAINS = {
 }
 
 
-# Set by the Dockerfile on images that carry cb-entry. ensure_image() rebuilds
-# one that lacks it.
-ENTRY_LABEL = "cb.entry"
-
 # What the image records about itself. claude-code is in there too — it is the
 # version question asked most often, and nothing else in the image can answer it.
 VERSION_LABEL = "cb.versions"
+# claude-code's version, set by CLAUDE_DOCKERFILE. cb.versions comes from the
+# base and only knows the toolchains.
+CLAUDE_LABEL = "cb.claude"
 LABELLED_VERSIONS = ("claude",) + tuple(TOOLCHAINS)
 
 
@@ -847,12 +852,16 @@ def remember_image_state(features, versions):
     write_json(image_state_path(), state)
 
 
-def image_exists():
-    return capture(["docker", "image", "inspect", CB_IMAGE]) is not None
+def image_exists(image=CB_IMAGE):
+    return capture(["docker", "image", "inspect", image]) is not None
 
 
-def image_label(name):
-    """One label off the image, or None if there is no image to read it from."""
+def image_label(name, image=CB_IMAGE):
+    """One label off the image, or None if there is no image to read it from.
+
+    Labels of the base carry over to CB_IMAGE, so asking CB_IMAGE answers for
+    both.
+    """
     out = capture(
         [
             "docker",
@@ -860,7 +869,7 @@ def image_label(name):
             "inspect",
             "--format",
             '{{index .Config.Labels "%s"}}' % name,
-            CB_IMAGE,
+            image,
         ]
     )
     return None if out is None else out.strip()
@@ -879,7 +888,13 @@ def image_features():
 def image_versions():
     """Which versions the image on disk was built at, the same way."""
     label = image_label(VERSION_LABEL)
-    return {} if label is None else parse_version_label(label)
+    if label is None:
+        return {}
+    versions = parse_version_label(label)
+    claude = image_label(CLAUDE_LABEL)
+    if claude:
+        versions["claude"] = claude
+    return versions
 
 
 def build_env():
@@ -901,15 +916,40 @@ def build_env():
     return env
 
 
-def build_image(features, versions, no_cache=False):
+def build_base(features, versions, no_cache=False):
+    """BASE_IMAGE: the Dockerfile in CB_DIR, which knows nothing of claude-code."""
     argv = ["docker", "build"]
     if no_cache:
         argv.append("--no-cache")
-    argv += ["--build-arg", "CLAUDE_CODE_VERSION=" + claude_version()]
     for assignment in feature_build_args(features) + version_build_args(versions):
         argv += ["--build-arg", assignment]
-    argv += ["--tag", CB_IMAGE, CB_DIR]
+    argv += ["--tag", BASE_IMAGE, CB_DIR]
     run(argv, env=build_env())
+
+
+def build_claude():
+    """CB_IMAGE: one npm install on top of BASE_IMAGE.
+
+    Always on top of the base, never on top of the previous CB_IMAGE, so
+    updates replace a layer instead of stacking one per release.
+    """
+    run(
+        [
+            "docker", "build",
+            "--file", CLAUDE_DOCKERFILE,
+            "--build-arg", "BASE_IMAGE=" + BASE_IMAGE,
+            "--build-arg", "CLAUDE_CODE_VERSION=" + claude_version(),
+            "--tag", CB_IMAGE,
+            CB_DIR,
+        ],
+        env=build_env(),
+    )
+
+
+def build_image(features, versions, no_cache=False):
+    """Both images, base first."""
+    build_base(features, versions, no_cache=no_cache)
+    build_claude()
 
 
 def ensure_image():
@@ -920,26 +960,20 @@ def ensure_image():
     a day and almost always on a warm cache, where a build is a registry round
     trip plus twenty lines of CACHED that read like a rebuild.
 
-    Nothing is cached on a first build, so this is the one place besides
-    rebuild-image where asking upstream for the newest toolchains costs nothing.
-
-    An image without cb-entry counts as missing: every box runs it, and docker
-    would fail on it only after cb has exec'd away and can no longer say why.
-    That rebuild keeps the image's own versions, like update-claude, so only the
-    layers from cb-entry down are redone.
+    Without a base both are built, and nothing is cached then, so this is the
+    one place besides rebuild-image where asking upstream for the newest
+    toolchains costs nothing. That also covers an install from before the split,
+    which has a CB_IMAGE and no base — and no cb-entry either. With the base
+    there, a missing CB_IMAGE is one npm install.
     """
-    if image_exists():
-        if image_label(ENTRY_LABEL):
-            return
-        print("cb: {} predates cb-entry, rebuilding".format(CB_IMAGE), file=sys.stderr)
+    if not image_exists(BASE_IMAGE):
         stored = read_json(image_state_path())
-        build_image(resolve_features(stored, {}), stored_versions(stored))
-        return
-    stored = read_json(image_state_path())
-    features = resolve_features(stored, {})
-    versions = refresh_versions(stored)
-    remember_image_state(features, versions)
-    build_image(features, versions)
+        features = resolve_features(stored, {})
+        versions = refresh_versions(stored)
+        remember_image_state(features, versions)
+        build_image(features, versions)
+    elif not image_exists(CB_IMAGE):
+        build_claude()
 
 
 # ---------------------------------------------------------------------------
@@ -1430,20 +1464,21 @@ def cmd_shell(flags, args):
 def cmd_update_claude(flags, args):
     """Pull in a new claude-code release for the next run.
 
-    Cheap on purpose: claude-code is the last layer in the Dockerfile, so a bump
-    invalidates nothing above it. With the version unchanged every layer is a
-    cache hit and this is a registry lookup and nothing else.
+    Builds CLAUDE_DOCKERFILE on top of the existing base and nothing else, so
+    whatever happened to the base's build cache — a prune, an edit higher up in
+    the Dockerfile — cannot turn this into a rebuild of Rust and Playwright.
+    A missing base is refused for the same reason: building it here would be
+    exactly that rebuild.
 
     Builds and stops: every run starts from the image, so the next one has the
     new binary. Boxes already running keep theirs until they exit.
-
-    The toolchains are the ones the image already has, deliberately: resolving
-    them here would bump Go or uv as a side effect of a claude-code release and
-    invalidate every layer below, which is exactly what this command avoids.
     """
     reject_extra("update-claude", args)
-    stored = read_json(image_state_path())
-    build_image(resolve_features(stored, {}), stored_versions(stored))
+    if not image_exists(BASE_IMAGE):
+        raise CbError(
+            "{} is missing — run `cb rebuild-image` to build it".format(BASE_IMAGE)
+        )
+    build_claude()
 
     if not DRY_RUN:
         print("\nbuilt {}. the next run uses it.".format(CB_IMAGE))
@@ -1459,8 +1494,8 @@ def cmd_rebuild_image(flags, args):
 
     Feature flags are remembered, so a later bare `cb rebuild-image` reproduces
     the same set. --no-cache is the nuclear option: it discards the Rust
-    toolchain, the from-source sqlx-cli build and the Playwright apt layer,
-    which update-claude gets you without.
+    toolchain, the from-source sqlx-cli build and the Playwright apt layer.
+    It applies to the base only; the claude-code layer is rebuilt either way.
 
     Builds and stops. Every run starts from the image, so the next one picks it
     up; a box already running keeps the image it was started from until it

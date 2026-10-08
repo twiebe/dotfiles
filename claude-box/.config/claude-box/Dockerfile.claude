@@ -1,0 +1,16 @@
+# claude-code on top of claude-box:base, which the Dockerfile next to this one
+# produces. Built by cb, on its own, for `cb update-claude`: it starts from the
+# base rather than building it, so a new claude-code release costs one npm
+# install whatever state the base's build cache is in.
+#
+# Always FROM the base, never from the previous claude-box:latest, so each
+# release replaces this layer instead of stacking another on top.
+ARG BASE_IMAGE=claude-box:base
+FROM ${BASE_IMAGE}
+
+# cb passes a concrete version rather than "latest": Docker caches a RUN by its
+# text, so "latest" would stay frozen at whatever it first resolved to.
+ARG CLAUDE_CODE_VERSION=latest
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+LABEL cb.claude=${CLAUDE_CODE_VERSION}
