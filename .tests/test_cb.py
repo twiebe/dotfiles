@@ -677,6 +677,11 @@ class ContainerEnvTest(unittest.TestCase):
             cb.container_env(docker=False)["CLAUDE_CONFIG_DIR"], cb.BOX_CLAUDE_DIR
         )
 
+    def test_keeps_playwright_from_deleting_other_boxes_browsers(self):
+        self.assertEqual(
+            cb.container_env(docker=False)["PLAYWRIGHT_SKIP_BROWSER_GC"], "1"
+        )
+
     def test_passes_the_hosts_terminal_through(self):
         os.environ["TERM_PROGRAM"] = "ghostty"
         self.assertEqual(cb.container_env(docker=False)["TERM_PROGRAM"], "ghostty")
@@ -739,6 +744,12 @@ class CreateArgvTest(unittest.TestCase):
             flag_values(self.argv, "--mount"),
         )
 
+    def test_mounts_the_shared_browser_cache(self):
+        self.assertIn(
+            "type=volume,source=cb-playwright,target=/home/node/.cache/ms-playwright",
+            flag_values(self.argv, "--mount"),
+        )
+
     def test_starts_in_the_workspace_folder(self):
         self.assertEqual(
             flag_values(self.argv, "--workdir"), [cb.workspace_folder(self.workspace)]
@@ -765,6 +776,69 @@ class CreateArgvTest(unittest.TestCase):
         # Nothing in the image stays in the foreground, so the container needs a
         # process that does; claude then arrives by `docker exec`.
         self.assertEqual(self.argv[-3:], [cb.CB_IMAGE, "sleep", "infinity"])
+
+
+class VolumePruneTest(unittest.TestCase):
+    """Which docker commands `cb volume prune` issues, recorded rather than run."""
+
+    def setUp(self):
+        self.commands = []
+        self.volumes = {"cb-playwright"}
+        self.dangling = "cb-history-aaaa\nnot-cb-history-bbbb\n"
+
+        def record(argv, quiet=False, check=True):
+            self.commands.append(list(argv))
+            return 0
+
+        def fake_capture(argv):
+            if argv[:3] == ["docker", "volume", "inspect"]:
+                return "[]" if argv[3] in self.volumes else None
+            if argv[:3] == ["docker", "volume", "ls"]:
+                return self.dangling
+            raise AssertionError(argv)
+
+        for name, value in (("run", record), ("capture", fake_capture)):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+
+    def prune(self, target):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return cb.cmd_volume({"yes": True}, ["prune", target])
+
+    def test_playwright_empties_the_volume_instead_of_removing_it(self):
+        # Every box has it mounted, so docker would refuse the removal.
+        self.prune("playwright")
+        self.assertEqual(self.commands, [cb.empty_volume_argv("cb-playwright")])
+
+    def test_playwright_leaves_the_history_alone(self):
+        self.prune("playwright")
+        self.assertFalse(any(argv[:3] == ["docker", "volume", "rm"] for argv in self.commands))
+
+    def test_all_also_removes_orphaned_history(self):
+        self.prune("all")
+        self.assertIn(["docker", "volume", "rm", "cb-history-aaaa"], self.commands)
+
+    def test_does_nothing_when_there_is_nothing(self):
+        self.volumes = set()
+        self.dangling = ""
+        self.prune("all")
+        self.assertEqual(self.commands, [])
+
+    def test_refuses_an_unknown_target(self):
+        with self.assertRaises(cb.UsageError):
+            cb.cmd_volume({"yes": True}, ["prune", "history"])
+
+    def test_refuses_without_a_target(self):
+        with self.assertRaises(cb.UsageError):
+            cb.cmd_volume({"yes": True}, ["prune"])
+
+    def test_asks_before_touching_anything(self):
+        # No terminal to answer on, which confirm() takes as a no.
+        self.addCleanup(setattr, cb.sys, "stdin", cb.sys.stdin)
+        cb.sys.stdin = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(cb.CbError):
+            cb.cmd_volume({"yes": False}, ["prune", "all"])
+        self.assertEqual(self.commands, [])
 
 
 class ExecArgvTest(unittest.TestCase):
