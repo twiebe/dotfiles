@@ -1049,6 +1049,10 @@ def container_env(docker):
         "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
         "CLAUDE_CONFIG_DIR": BOX_CLAUDE_DIR,
         "NODE_OPTIONS": "--max-old-space-size=4096",
+        # Ctrl+G wrapper for the /reply skill in the shared ~/.claude; it falls
+        # back to plain vim outside Claude Code. claude is exec'd without a
+        # shell, so this cannot live in a zsh startup file.
+        "VISUAL": BOX_CLAUDE_DIR + "/skills/reply/editor.sh",
     }
     for name in PASSTHROUGH_ENV:
         value = os.environ.get(name)
