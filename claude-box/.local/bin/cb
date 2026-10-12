@@ -389,8 +389,14 @@ def extract_flags(args):
 # ---------------------------------------------------------------------------
 
 IMAGE_FEATURES = (
-    "docker", "go", "kubernetes", "playwright", "python", "rust", "sqlx", "tofu",
+    "docker", "ffmpeg", "go", "kubernetes", "pandoc", "playwright-deps",
+    "python", "rust", "sqlx", "tofu",
 )
+
+# Features that changed their name, old to new. Both image.json and the label of
+# an image built before the rename still say the old one, and dropping it as
+# unknown would quietly turn the feature off at the next rebuild.
+RENAMED_FEATURES = {"playwright": "playwright-deps"}
 
 # The image carries its own answer as a label, so `docker inspect` stays
 # authoritative even when the state file has been lost or hand-edited. The file
@@ -473,6 +479,7 @@ def parse_feature_label(label):
     features = {}
     for entry in (label or "").split(","):
         name, _, value = entry.partition("=")
+        name = RENAMED_FEATURES.get(name, name)
         if name in IMAGE_FEATURES and value in ("0", "1"):
             features[name] = value == "1"
     return features
@@ -481,7 +488,7 @@ def parse_feature_label(label):
 def feature_build_args(features):
     """`WITH_X=…` assignments, one per feature, for `docker build --build-arg`."""
     return [
-        "WITH_{}={}".format(name.upper(), int(value))
+        "WITH_{}={}".format(name.upper().replace("-", "_"), int(value))
         for name, value in sorted(features.items())
     ]
 
@@ -684,6 +691,19 @@ def pick_box(rows, workspace, name):
 
 def image_state_path():
     return os.path.join(state_dir(), "image.json")
+
+
+def read_image_state():
+    """image.json, with features stored under an old name moved to the new one.
+
+    Every write of the file starts from what this returns, so the old key is
+    gone after the next `cb image-config` or rebuild.
+    """
+    stored = read_json(image_state_path())
+    for old, new in RENAMED_FEATURES.items():
+        if old in stored and new not in stored:
+            stored[new] = stored.pop(old)
+    return stored
 
 
 def fetch_json(url):
@@ -991,7 +1011,7 @@ def ensure_image():
     there, a missing CB_IMAGE is one npm install.
     """
     if not image_exists(BASE_IMAGE):
-        stored = read_json(image_state_path())
+        stored = read_image_state()
         features = resolve_features(stored, {})
         versions = refresh_versions(stored)
         remember_image_state(features, versions)
@@ -1529,7 +1549,7 @@ def cmd_rebuild_image(flags, args):
     no_cache = "--no-cache" in args
     reject_extra("rebuild-image", [arg for arg in args if arg != "--no-cache"])
 
-    stored = read_json(image_state_path())
+    stored = read_image_state()
     features = resolve_features(stored, overrides)
     versions = refresh_versions(stored)
     remember_image_state(features, versions)
@@ -1619,7 +1639,7 @@ def cmd_image_config(flags, args):
     should be asked for by name. Each line says when the image on disk differs
     from what the next build will produce.
     """
-    stored = read_json(image_state_path())
+    stored = read_image_state()
     if len(args) == 2:
         return set_feature(stored, args[0], args[1])
     if len(args) == 1:
