@@ -108,7 +108,8 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 #   git-delta 0.18.2  fzf 0.60.3  gh 2.46.0
 #   cmake 3.31.6  curl 8.14.1  sqlite3 3.46.1
 #
-# Python is not in this list: it is the python feature, further down.
+# Python, ffmpeg and pandoc are not in this list: each is a feature, further
+# down.
 #
 # Every entry below names the command that breaks without it. The four added
 # most recently:
@@ -132,7 +133,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   cmake \
   curl \
-  ffmpeg \
   fzf \
   gh \
   git \
@@ -142,7 +142,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   just \
   less \
   lua5.4 \
-  pandoc \
   pkg-config \
   procps \
   sqlite3 \
@@ -354,12 +353,41 @@ ENV CARGO_TARGET_DIR=/home/node/.cache/cargo-target
 #
 # Stays this low in the file even though it is now a small layer: a change here
 # must not invalidate the Rust toolchain and the sqlx-cli build above it.
-ARG WITH_PLAYWRIGHT=0
-RUN if [ "$WITH_PLAYWRIGHT" = 1 ]; then \
-      sudo apt-get update \
-      && sudo npx --yes playwright@latest install-deps chromium \
-      && sudo rm -rf /var/lib/apt/lists/* /root/.npm; \
-    fi
+#
+# The feature is called playwright-deps rather than playwright because that is
+# all it is. Under the old name Claude in a box went looking for Playwright,
+# found no module, no package and an empty browser cache, and concluded the
+# feature was missing. The note below closes the rest of that gap: it goes to
+# /etc/claude-code/CLAUDE.md, the managed-policy memory Claude Code loads on
+# Linux in every session, because ~/.claude is the host's directory
+# bind-mounted in and nothing written there at build time would survive. A
+# stub `playwright` binary was the alternative and does not work: npx resolves
+# the package, not PATH, and a venv's own entry point shadows anything here.
+ARG WITH_PLAYWRIGHT_DEPS=0
+RUN <<'EOF'
+set -e
+[ "$WITH_PLAYWRIGHT_DEPS" = 1 ] || exit 0
+sudo apt-get update
+sudo npx --yes playwright@latest install-deps chromium
+sudo rm -rf /var/lib/apt/lists/* /root/.npm
+sudo mkdir -p /etc/claude-code
+sudo tee /etc/claude-code/CLAUDE.md >/dev/null <<'NOTE'
+# Playwright in this box
+
+The system libraries Chromium needs are already installed (the image's
+playwright-deps feature). Playwright itself and its browsers are not: install
+them per project, at the version the project pins.
+
+- Node: `npm install` (or `npm i -D @playwright/test` if the project has none),
+  then `npx playwright install chromium`.
+- Python: inside a venv, `pip install playwright`, then
+  `playwright install chromium`.
+
+Do not run `playwright install-deps` or `install --with-deps`: that needs root
+and is already done. Browsers go to ~/.cache/ms-playwright, a volume every box
+shares, so a revision some box already downloaded is there to reuse.
+NOTE
+EOF
 
 # The mount point of cb's shared browser volume, created here so that it and
 # ~/.cache above it belong to node. Docker copies the mount point's ownership
@@ -438,6 +466,28 @@ RUN if [ "$WITH_PYTHON" = 1 ]; then \
            /opt/uv/uv tool install --no-cache --python /usr/bin/python3 ipython; \
     fi
 
+# ffmpeg and pandoc used to sit in the base apt block, where together they were
+# half of its download: ffmpeg alone pulls in 231 packages, llvm and mesa among
+# them, 111 of the block's 270 MB; pandoc is 26 MB to fetch and 200 MB on disk.
+# As features they cost nothing in a box that never converts media or documents.
+#
+# Two layers rather than one, so toggling either redoes only its own, and low in
+# the file for the same reason as everything around them: a toggle here must not
+# invalidate the Rust toolchain or the sqlx-cli build.
+ARG WITH_FFMPEG=0
+RUN if [ "$WITH_FFMPEG" = 1 ]; then \
+      sudo apt-get update \
+      && sudo apt-get install -y --no-install-recommends ffmpeg \
+      && sudo rm -rf /var/lib/apt/lists/*; \
+    fi
+
+ARG WITH_PANDOC=0
+RUN if [ "$WITH_PANDOC" = 1 ]; then \
+      sudo apt-get update \
+      && sudo apt-get install -y --no-install-recommends pandoc \
+      && sudo rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # The only COPYs from the build context, and the reason they sit this low: a
 # COPY is cached on the content of what it copies, so every edit to one of these
 # scripts invalidates the layer and everything below it. Further up — where
@@ -463,7 +513,7 @@ COPY --chmod=0755 cb-entry /usr/local/bin/cb-entry
 # nothing, so it must not sit above a layer that is expensive to redo.
 ARG WITH_GO
 ARG WITH_TOFU
-LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},kubernetes=${WITH_KUBERNETES},playwright=${WITH_PLAYWRIGHT},python=${WITH_PYTHON},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
+LABEL cb.features="docker=${WITH_DOCKER},ffmpeg=${WITH_FFMPEG},go=${WITH_GO},kubernetes=${WITH_KUBERNETES},pandoc=${WITH_PANDOC},playwright-deps=${WITH_PLAYWRIGHT_DEPS},python=${WITH_PYTHON},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
 
 # Which versions those features came out at. Worth recording now that cb resolves
 # them instead of this file fixing them: "what uv is in the box" otherwise has no

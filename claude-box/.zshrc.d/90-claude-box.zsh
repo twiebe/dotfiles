@@ -21,7 +21,7 @@ _cb() {
     'image-config:show or set the image'"'"'s toolchains'
     'volume:prune the volumes cb keeps'
   )
-  features=(docker go kubernetes playwright python rust sqlx tofu)
+  features=(docker ffmpeg go kubernetes pandoc playwright-deps python rust sqlx tofu)
 
   if (( CURRENT == 2 )); then
     _describe -t commands 'cb command' subcommands
