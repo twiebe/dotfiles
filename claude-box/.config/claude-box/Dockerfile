@@ -23,7 +23,8 @@
 # `docker build` in this directory gets, and what cb falls back to when a lookup
 # is down; bump them when the gap gets embarrassing, not routinely.
 #
-# WITH_GO, WITH_TOFU and WITH_KUBERNETES are global for the same reason. Unlike
+# WITH_GO, WITH_TOFU, WITH_KUBERNETES and WITH_PYTHON are global for the same
+# reason. Unlike
 # the other toggles they cannot be a shell condition inside a RUN: all three
 # arrive by COPY --from, and an `if` would have to copy the payload in and
 # delete it afterwards, which leaves it in the layer. The stage aliases below
@@ -34,11 +35,19 @@ ARG UV_VERSION=0.12.1
 ARG GO_VERSION=1.26.5
 ARG TOFU_VERSION=1.12.6
 ARG KUBECTL_VERSION=1.37.1
-ARG WITH_GO=1
-ARG WITH_TOFU=1
-ARG WITH_KUBERNETES=1
+ARG WITH_GO=0
+ARG WITH_TOFU=0
+ARG WITH_KUBERNETES=0
+ARG WITH_PYTHON=0
 
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+# Same shape as tofu below: the uv image is scratch with /uv and /uvx in it.
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-bin
+FROM node:26-trixie-slim AS python-1
+COPY --from=uv-bin /uv /uvx /opt/uv/
+FROM node:26-trixie-slim AS python-0
+RUN mkdir -p /opt/uv
+FROM python-${WITH_PYTHON} AS uv
+
 FROM golang:${GO_VERSION}-trixie AS go-1
 FROM node:26-trixie-slim AS go-0
 RUN mkdir -p /usr/local/go
@@ -73,9 +82,11 @@ FROM kubernetes-${WITH_KUBERNETES} AS kubernetes
 # Go, OpenTofu and kubectl, all copied out of official images (see above).
 FROM node:26-trixie-slim
 
-# Build-time knobs default to the full image: cb passes a --build-arg per
-# feature, but `docker build` in this directory has to produce the intended
-# image on its own, without that list in front of it.
+# Feature toggles (WITH_*) default to off, every one of them and every one added
+# later: a toolchain is in the image because someone asked for it, never because
+# it happened to exist when the image was first built. cb passes a --build-arg
+# per feature from `cb image-config`; a bare `docker build` in this directory
+# produces the same lean image cb builds for a fresh install.
 ARG TZ=Europe/Berlin
 ENV TZ="$TZ"
 
@@ -94,13 +105,10 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 # Anything that is per-project or personal taste (starship, direnv, language
 # toolchains beyond the ones below) belongs in the project, not here.
 # trixie versions as of this commit:
-#   git-delta 0.18.2  fzf 0.60.3  gh 2.46.0  python3 3.13
+#   git-delta 0.18.2  fzf 0.60.3  gh 2.46.0
 #   cmake 3.31.6  curl 8.14.1  sqlite3 3.46.1
 #
-# python3 is marked externally-managed (PEP 668), so a bare `pip3 install`
-# outside a virtualenv refuses to touch the system site-packages. That is the
-# intended behaviour — use `python3 -m venv` or uv above. python3-pip is here
-# for use *inside* those environments, python3-venv for creating them.
+# Python is not in this list: it is the python feature, further down.
 #
 # Every entry below names the command that breaks without it. The four added
 # most recently:
@@ -137,9 +145,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   pandoc \
   pkg-config \
   procps \
-  python3 \
-  python3-pip \
-  python3-venv \
   sqlite3 \
   sudo \
   time \
@@ -149,16 +154,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   zsh \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=uv /uv /uvx /usr/local/bin/
-
 # Rust costs ~1.5 GB with its toolchain, which is why it is the first thing
-# worth turning off in a box that never builds Rust. On by default: a box that
-# cannot build the project it is pointed at is not worth the layer it saves.
+# worth leaving off in a box that never builds Rust. Off by default like every
+# feature; `cb image-config rust true` turns it on.
 #
 # just is not here — it is a general task runner that merely ships next to Rust
 # in Debian, and losing it with --without-rust would be a surprise. It sits in
 # the base apt block above.
-ARG WITH_RUST=1
+ARG WITH_RUST=0
 RUN if [ "$WITH_RUST" = 1 ]; then \
       apt-get update \
       && apt-get install -y --no-install-recommends rustup clang cbindgen \
@@ -191,7 +194,7 @@ RUN if [ "$WITH_RUST" = 1 ]; then \
 # the deprecated classic builder, and anything asking for BuildKit — cb itself
 # when run inside a box, any Dockerfile with a `# syntax` line or COPY --chmod —
 # fails with "BuildKit is enabled but the buildx component is missing".
-ARG WITH_DOCKER=1
+ARG WITH_DOCKER=0
 RUN if [ "$WITH_DOCKER" = 1 ]; then \
       apt-get update \
       && apt-get install -y --no-install-recommends \
@@ -267,7 +270,7 @@ ENV HISTFILE=/commandhistory/.zsh_history
 ENV CARGO_HOME=/home/node/.cargo
 ENV RUSTUP_HOME=/home/node/.rustup
 ENV PATH=/home/node/.cargo/bin:$PATH
-ARG WITH_RUST=1
+ARG WITH_RUST=0
 RUN if [ "$WITH_RUST" = 1 ]; then rustup default stable; fi
 
 # ~250 MB, and above claude-code for the same cache reason as Rust.
@@ -298,7 +301,7 @@ ENV PATH=/usr/local/go/bin:/home/node/go/bin:$PATH
 # Above claude-code for the usual cache reason — this is a from-source build of
 # several minutes and must not be redone for a claude-code release.
 ARG SQLX_VERSION=0.9.0
-ARG WITH_SQLX=1
+ARG WITH_SQLX=0
 RUN if [ "$WITH_SQLX" = 1 ] && [ "$WITH_RUST" = 1 ]; then \
       cargo install sqlx-cli@${SQLX_VERSION} --locked \
         --no-default-features \
@@ -351,7 +354,7 @@ ENV CARGO_TARGET_DIR=/home/node/.cache/cargo-target
 #
 # Stays this low in the file even though it is now a small layer: a change here
 # must not invalidate the Rust toolchain and the sqlx-cli build above it.
-ARG WITH_PLAYWRIGHT=1
+ARG WITH_PLAYWRIGHT=0
 RUN if [ "$WITH_PLAYWRIGHT" = 1 ]; then \
       sudo apt-get update \
       && sudo npx --yes playwright@latest install-deps chromium \
@@ -400,11 +403,39 @@ ENV PATH=/opt/tofu:$PATH
 # invalidates them and the claude-code layer alone.
 COPY --from=kubernetes /opt/kubernetes /opt/kubernetes
 ENV PATH=/opt/kubernetes:$PATH
-ARG WITH_KUBERNETES=1
+ARG WITH_KUBERNETES=0
 RUN if [ "$WITH_KUBERNETES" = 1 ]; then \
       sudo apt-get update \
       && sudo apt-get install -y --no-install-recommends kustomize \
       && sudo rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Python: trixie's python3 with pip and venv, uv, and IPython.
+#
+# python3 is marked externally-managed (PEP 668), so a bare `pip3 install`
+# outside a virtualenv refuses to touch the system site-packages. That is the
+# intended behaviour — use `python3 -m venv` or uv. python3-pip is here for use
+# *inside* those environments, python3-venv for creating them.
+#
+# IPython is a `uv tool install` rather than trixie's ipython3, so it tracks
+# upstream like uv itself does. Installed as root into /opt/uv-tools with its
+# entry point in /usr/local/bin, so it is on every PATH and does not live under
+# /home/node; pinned to the apt interpreter so uv never downloads one of its own.
+#
+# uv arrives by COPY --from like tofu, which is why the stage picked at the top
+# decides whether there is a uv at all; the apt and IPython half is a plain RUN.
+# Low in the file: small layers, and a UV_VERSION bump must not invalidate
+# anything expensive.
+COPY --from=uv /opt/uv /opt/uv
+ENV PATH=/opt/uv:$PATH
+ARG WITH_PYTHON=0
+RUN if [ "$WITH_PYTHON" = 1 ]; then \
+      sudo apt-get update \
+      && sudo apt-get install -y --no-install-recommends \
+           python3 python3-pip python3-venv \
+      && sudo rm -rf /var/lib/apt/lists/* \
+      && sudo env UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
+           /opt/uv/uv tool install --no-cache --python /usr/bin/python3 ipython; \
     fi
 
 # The only COPYs from the build context, and the reason they sit this low: a
@@ -432,7 +463,7 @@ COPY --chmod=0755 cb-entry /usr/local/bin/cb-entry
 # nothing, so it must not sit above a layer that is expensive to redo.
 ARG WITH_GO
 ARG WITH_TOFU
-LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},kubernetes=${WITH_KUBERNETES},playwright=${WITH_PLAYWRIGHT},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
+LABEL cb.features="docker=${WITH_DOCKER},go=${WITH_GO},kubernetes=${WITH_KUBERNETES},playwright=${WITH_PLAYWRIGHT},python=${WITH_PYTHON},rust=${WITH_RUST},sqlx=${WITH_SQLX},tofu=${WITH_TOFU}"
 
 # Which versions those features came out at. Worth recording now that cb resolves
 # them instead of this file fixing them: "what uv is in the box" otherwise has no
