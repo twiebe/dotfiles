@@ -394,14 +394,21 @@ class FeatureFlagsTest(unittest.TestCase):
 
 
 class ResolveFeaturesTest(unittest.TestCase):
-    """Features are a property of the one shared image. Everything is on by
-    default, so a bare `docker build` in .config/claude-box still produces the
-    intended image — the rule the Dockerfile header sets."""
+    """Features are a property of the one shared image. Everything is off by
+    default, including features added later, so a toolchain is only there when
+    asked for — and a bare `docker build` in .config/claude-box produces the
+    same lean image."""
 
-    def test_everything_defaults_to_on(self):
+    def test_everything_defaults_to_off(self):
         features = cb.resolve_features(stored={}, overrides={})
         self.assertEqual(set(features), set(cb.IMAGE_FEATURES))
-        self.assertTrue(all(features.values()))
+        self.assertFalse(any(features.values()))
+
+    def test_dockerfile_defaults_match(self):
+        dockerfile = (CB_PATH.parents[2] / ".config" / "claude-box" / "Dockerfile").read_text()
+        for feature in cb.IMAGE_FEATURES:
+            self.assertIn("ARG WITH_{}=0".format(feature.upper()), dockerfile)
+            self.assertNotIn("ARG WITH_{}=1".format(feature.upper()), dockerfile)
 
     def test_stored_answer_is_remembered(self):
         features = cb.resolve_features(stored={"go": False}, overrides={})
@@ -418,7 +425,7 @@ class ResolveFeaturesTest(unittest.TestCase):
         self.assertIs(features["sqlx"], False)
 
     def test_sqlx_can_be_dropped_on_its_own(self):
-        features = cb.resolve_features(stored={}, overrides={"sqlx": False})
+        features = cb.resolve_features(stored={"rust": True, "sqlx": True}, overrides={"sqlx": False})
         self.assertEqual((features["sqlx"], features["rust"]), (False, True))
 
     def test_asking_for_sqlx_without_rust_is_refused(self):
@@ -426,6 +433,14 @@ class ResolveFeaturesTest(unittest.TestCase):
         # to build.
         with self.assertRaises(cb.UsageError):
             cb.resolve_features(stored={}, overrides={"rust": False, "sqlx": True})
+
+    def test_asking_for_sqlx_with_rust_off_by_default_is_refused(self):
+        with self.assertRaises(cb.UsageError):
+            cb.resolve_features(stored={}, overrides={"sqlx": True})
+
+    def test_sqlx_with_rust_from_the_file(self):
+        features = cb.resolve_features(stored={"rust": True}, overrides={"sqlx": True})
+        self.assertEqual((features["sqlx"], features["rust"]), (True, True))
 
 
 class FeatureLabelTest(unittest.TestCase):
@@ -690,6 +705,79 @@ class ImageBuildTest(unittest.TestCase):
         self.images = {cb.BASE_IMAGE}
         self.quietly(cb.ensure_image)
         self.assertEqual(self.tags(), [[cb.CB_IMAGE]])
+
+
+class ImageConfigTest(unittest.TestCase):
+    """`cb image-config` reads and writes image.json and builds nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "image.json"
+        self.state.write_text('{"tofu": false, "versions": {"go": "1.26.5"}}')
+        self.built = {feature: True for feature in cb.IMAGE_FEATURES}
+
+        def no_build(*args, **kwargs):
+            raise AssertionError("image-config must not build")
+
+        for name, value in (
+            ("image_state_path", lambda: str(self.state)),
+            ("image_features", lambda: self.built),
+            ("run", no_build),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+
+    def image_config(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cb.cmd_image_config({"yes": False}, list(args))
+        return out.getvalue()
+
+    def stored(self):
+        return cb.read_json(str(self.state))
+
+    def test_lists_every_feature_with_its_source(self):
+        out = self.image_config()
+        self.assertIn("tofu", out)
+        self.assertRegex(out, r"tofu\s+false\s+\(file\)")
+        self.assertRegex(out, r"rust\s+false\s+\(default\)")
+        self.assertIn("go 1.26.5", out)
+
+    def test_flags_a_feature_the_image_disagrees_with(self):
+        self.built["rust"] = False
+        out = self.image_config("tofu")
+        self.assertIn("image has true", out)
+        self.assertNotIn("image has", self.image_config("rust"))
+
+    def test_set_keeps_versions_and_other_features(self):
+        self.image_config("rust", "false")
+        self.assertEqual(
+            self.stored(),
+            {"tofu": False, "rust": False, "versions": {"go": "1.26.5"}},
+        )
+
+    def test_without_rust_sqlx_reports_why_it_is_off(self):
+        self.image_config("rust", "false")
+        self.assertRegex(self.image_config("sqlx"), r"sqlx\s+false\s+\(needs rust\)")
+
+    def test_refuses_sqlx_without_rust(self):
+        self.image_config("rust", "false")
+        with self.assertRaises(cb.UsageError):
+            self.image_config("sqlx", "true")
+        self.assertNotIn("sqlx", self.stored())
+
+    def test_refuses_unknown_feature_and_bad_value(self):
+        with self.assertRaises(cb.UsageError):
+            self.image_config("cobol", "true")
+        with self.assertRaises(cb.UsageError):
+            self.image_config("rust", "yes")
+
+    def test_rebuild_image_uses_what_was_set(self):
+        self.image_config("playwright", "false")
+        features = cb.resolve_features(self.stored(), {})
+        self.assertFalse(features["playwright"])
+        self.assertFalse(features["tofu"])
 
 
 class ImageVersionsTest(unittest.TestCase):

@@ -251,6 +251,7 @@ SUBCOMMANDS = (
     "rebuild-image",
     "update-claude",
     "config",
+    "image-config",
     "volume",
 )
 
@@ -381,12 +382,15 @@ def extract_flags(args):
 # of the image and not of a box: one image, one tag, so a lean set costs
 # nothing to resolve and cannot leave two boxes fighting over a tag.
 #
-# All default to on, which is what keeps a bare `docker build` in
-# .config/claude-box producing the same base cb builds — the Dockerfile has to
-# stand on its own, without cb's --build-arg list in front of it.
+# All default to off, and so does every feature added later: a toolchain is in
+# the image because `cb image-config` or --with-X asked for it. The Dockerfile's
+# WITH_* ARGs default to 0 to match, which keeps a bare `docker build` in
+# .config/claude-box producing the same base cb builds for a fresh install.
 # ---------------------------------------------------------------------------
 
-IMAGE_FEATURES = ("docker", "go", "kubernetes", "playwright", "rust", "sqlx", "tofu")
+IMAGE_FEATURES = (
+    "docker", "go", "kubernetes", "playwright", "python", "rust", "sqlx", "tofu",
+)
 
 # The image carries its own answer as a label, so `docker inspect` stays
 # authoritative even when the state file has been lost or hand-edited. The file
@@ -409,14 +413,12 @@ def extract_feature_flags(args):
 
 
 def resolve_features(stored, overrides):
-    """Effective feature set: flag beats file beats on.
+    """Effective feature set: flag beats file beats off.
 
     sqlx-cli is a cargo build, so it cannot outlive the toolchain: dropping rust
-    drops it too. Asking for both at once is refused rather than resolved,
-    because either answer contradicts one of the two flags.
+    drops it too. --with-sqlx without rust is refused rather than resolved,
+    because either answer contradicts something that was asked for.
     """
-    if overrides.get("rust") is False and overrides.get("sqlx") is True:
-        raise UsageError("--with-sqlx needs rust; drop --without-rust")
 
     features = {}
     for feature in IMAGE_FEATURES:
@@ -425,11 +427,33 @@ def resolve_features(stored, overrides):
         elif feature in stored:
             features[feature] = bool(stored[feature])
         else:
-            features[feature] = True
+            features[feature] = False
 
+    if overrides.get("sqlx") is True and not features["rust"]:
+        raise UsageError("--with-sqlx needs rust; add --with-rust")
     if not features["rust"]:
         features["sqlx"] = False
     return features
+
+
+def feature_sources(stored):
+    """What the next build gets, as {feature: (value, source)}.
+
+    The image-config counterpart of resolve_settings. A sqlx that is on in the
+    file but cannot be built says why, so the file and the answer disagreeing
+    does not read as a bug.
+    """
+    features = resolve_features(stored, {})
+    sources = {}
+    for feature, value in features.items():
+        if feature == "sqlx" and not features["rust"]:
+            source = "needs rust"
+        elif feature in stored:
+            source = "file"
+        else:
+            source = "default"
+        sources[feature] = (value, source)
+    return sources
 
 
 def feature_label(features):
@@ -1587,6 +1611,73 @@ def cmd_config(flags, args):
     return 0
 
 
+def cmd_image_config(flags, args):
+    """`cb config` for the image: which toolchains the next build includes.
+
+    Writes the same image.json that rebuild-image's --with-X/--without-X write,
+    and builds nothing — changing a feature is a twenty-minute rebuild, which
+    should be asked for by name. Each line says when the image on disk differs
+    from what the next build will produce.
+    """
+    stored = read_json(image_state_path())
+    if len(args) == 2:
+        return set_feature(stored, args[0], args[1])
+    if len(args) == 1:
+        check_feature(args[0])
+        shown = [args[0]]
+    else:
+        reject_extra("image-config", args)
+        shown = sorted(IMAGE_FEATURES)
+
+    sources = feature_sources(stored)
+    built = image_features()
+    for feature in shown:
+        value, source = sources[feature]
+        line = "{:<11} {:<6} ({})".format(feature, str(value).lower(), source)
+        if built is not None and built.get(feature, False) != value:
+            line += "  image has {}, apply with `cb rebuild-image`".format(
+                str(built.get(feature, False)).lower()
+            )
+        print(line)
+
+    if len(shown) > 1:
+        versions = stored_versions(stored)
+        if versions:
+            print("\nversions    " + "  ".join(
+                "{} {}".format(name, versions[name]) for name in sorted(versions)
+            ))
+        print("\n" + image_state_path())
+    return 0
+
+
+def check_feature(feature):
+    if feature not in IMAGE_FEATURES:
+        raise UsageError(
+            "unknown feature: {} (known: {})".format(feature, " ".join(IMAGE_FEATURES))
+        )
+
+
+def set_feature(stored, feature, value):
+    """Change one feature in image.json, leaving versions and the rest alone.
+
+    Turning sqlx on while rust is off is refused, as --with-sqlx --without-rust
+    is: storing it would print as on and build as off.
+    """
+    check_feature(feature)
+    if value not in ("true", "false"):
+        raise UsageError("{} takes true or false, not {}".format(feature, value))
+    enabled = value == "true"
+    if feature == "sqlx" and enabled and not resolve_features(stored, {})["rust"]:
+        raise UsageError("sqlx needs rust; `cb image-config rust true` first")
+
+    updated = dict(stored)
+    updated[feature] = enabled
+    write_json(image_state_path(), updated)
+    print("{} {} ({})".format(feature, value, image_state_path()))
+    print("takes effect with the next `cb rebuild-image`")
+    return 0
+
+
 def show_setting(key):
     workspace = current_workspace()
     settings = resolve_settings(load_settings(settings_path(workspace)), {})
@@ -1788,6 +1879,8 @@ USAGE = """usage: cb [command] [options]
   cb mount ls              mounts every run in this directory gets
   cb update-claude         rebuild with the newest claude-code
   cb rebuild-image [--no-cache] [--with-X|--without-X]…
+  cb image-config [FEATURE [true|false]]
+                           toolchains the next rebuild-image includes
   cb config [KEY [VALUE]] [--prune]
   cb volume prune playwright
                            empty the browser cache every box shares
@@ -1825,6 +1918,7 @@ COMMANDS = {
     "rebuild-image": cmd_rebuild_image,
     "update-claude": cmd_update_claude,
     "config": cmd_config,
+    "image-config": cmd_image_config,
     "volume": cmd_volume,
 }
 
