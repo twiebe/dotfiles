@@ -790,50 +790,161 @@ class ImageVersionsTest(unittest.TestCase):
         )
 
 
-class InRootsTest(unittest.TestCase):
+class IsEnabledTest(unittest.TestCase):
     """A box bind-mounts the directory it starts in and hands it to an agent
     with permissions loosened, so the gate is what stops a stray cd from
-    exposing $HOME."""
+    exposing $HOME. Directories opt in through a tag file."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name).resolve()
         self.root = self.base / "git"
-        self.root.mkdir()
+        self.repo = self.root / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        self.plain = self.root / "plain"
+        self.plain.mkdir()
 
-    def test_the_root_itself_is_allowed(self):
-        self.assertTrue(cb.in_roots(str(self.root), [str(self.root)]))
+    def tag(self, where, mode):
+        (where / cb.TAG_FILE).write_text(mode + "\n")
 
-    def test_a_directory_below_the_root_is_allowed(self):
-        repo = self.root / "repo"
-        repo.mkdir()
-        self.assertTrue(cb.in_roots(str(repo), [str(self.root)]))
+    def test_no_tag_anywhere_is_refused(self):
+        self.assertFalse(cb.is_enabled(str(self.repo)))
 
-    def test_a_directory_outside_is_refused(self):
-        other = self.base / "elsewhere"
-        other.mkdir()
-        self.assertFalse(cb.in_roots(str(other), [str(self.root)]))
+    def test_all_enables_the_directory_itself(self):
+        self.tag(self.root, "all")
+        self.assertTrue(cb.is_enabled(str(self.root)))
 
-    def test_a_sibling_sharing_the_prefix_is_refused(self):
-        # A plain startswith would let ~/gitignored through as if it were
-        # inside ~/git.
-        sibling = self.base / "gitignored"
-        sibling.mkdir()
-        self.assertFalse(cb.in_roots(str(sibling), [str(self.root)]))
+    def test_all_enables_any_directory_below(self):
+        self.tag(self.root, "all")
+        deep = self.plain / "a" / "b"
+        deep.mkdir(parents=True)
+        self.assertTrue(cb.is_enabled(str(deep)))
 
-    def test_a_symlinked_root_still_counts(self):
-        # cd through a symlinked ~/git and $PWD no longer names the root.
-        link = self.base / "linked"
-        link.symlink_to(self.root)
-        self.assertTrue(cb.in_roots(str(link / "."), [str(self.root)]))
+    def test_git_enables_a_checkout_below(self):
+        self.tag(self.root, "git")
+        self.assertTrue(cb.is_enabled(str(self.repo)))
 
-    def test_a_root_that_does_not_exist_never_matches(self):
-        self.assertFalse(cb.in_roots(str(self.root), [str(self.base / "absent")]))
+    def test_git_refuses_a_directory_without_git(self):
+        self.tag(self.root, "git")
+        self.assertFalse(cb.is_enabled(str(self.plain)))
 
-    def test_any_matching_root_is_enough(self):
-        roots = [str(self.base / "absent"), str(self.root)]
-        self.assertTrue(cb.in_roots(str(self.root), roots))
+    def test_git_refuses_a_subdirectory_of_a_checkout(self):
+        self.tag(self.root, "git")
+        sub = self.repo / "src"
+        sub.mkdir()
+        self.assertFalse(cb.is_enabled(str(sub)))
+
+    def test_git_accepts_a_worktree_with_a_git_file(self):
+        self.tag(self.root, "git")
+        worktree = self.root / "worktree"
+        worktree.mkdir()
+        (worktree / ".git").write_text("gitdir: /somewhere\n")
+        self.assertTrue(cb.is_enabled(str(worktree)))
+
+    def test_the_nearest_tag_wins(self):
+        self.tag(self.base, "all")
+        self.tag(self.root, "git")
+        self.assertFalse(cb.is_enabled(str(self.plain)))
+        self.assertTrue(cb.is_enabled(str(self.base)))
+
+    def test_disable_overrides_a_tag_further_up(self):
+        self.tag(self.base, "all")
+        self.tag(self.root, "disable")
+        self.assertFalse(cb.is_enabled(str(self.repo)))
+        self.assertTrue(cb.is_enabled(str(self.base)))
+
+    def test_a_tag_below_disable_enables_again(self):
+        self.tag(self.base, "disable")
+        self.tag(self.root, "git")
+        self.assertTrue(cb.is_enabled(str(self.repo)))
+
+    def test_a_tag_below_does_not_reach_up(self):
+        self.tag(self.repo, "all")
+        self.assertFalse(cb.is_enabled(str(self.root)))
+
+    def test_the_walk_follows_the_path_as_spelled(self):
+        # A tag next to a symlinked ~/git governs it, though the real
+        # directory lives somewhere else.
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "repo" / ".git").mkdir(parents=True)
+        home = self.base / "home"
+        home.mkdir()
+        (home / "git").symlink_to(elsewhere)
+        self.tag(home, "git")
+        self.assertTrue(cb.is_enabled(str(home / "git" / "repo")))
+
+    def test_an_unknown_mode_is_an_error(self):
+        self.tag(self.root, "everything")
+        with self.assertRaises(cb.UsageError):
+            cb.is_enabled(str(self.repo))
+
+
+class EnableCommandTest(unittest.TestCase):
+    """cb enable, disable and enabled write, remove and read the tag."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.addCleanup(setattr, cb, "current_workspace", cb.current_workspace)
+        cb.current_workspace = lambda: str(self.base)
+
+    def run_quietly(self, command, args):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return command({}, args)
+
+    def test_enable_defaults_to_the_current_directory(self):
+        self.run_quietly(cb.cmd_enable, ["all"])
+        self.assertEqual((self.base / cb.TAG_FILE).read_text(), "all\n")
+
+    def test_enable_takes_a_directory_relative_to_here(self):
+        (self.base / "sub").mkdir()
+        self.run_quietly(cb.cmd_enable, ["git", "sub"])
+        self.assertEqual((self.base / "sub" / cb.TAG_FILE).read_text(), "git\n")
+
+    def test_enable_overwrites_the_mode(self):
+        self.run_quietly(cb.cmd_enable, ["all"])
+        self.run_quietly(cb.cmd_enable, ["git"])
+        self.assertEqual((self.base / cb.TAG_FILE).read_text(), "git\n")
+
+    def test_enable_needs_a_known_mode(self):
+        for args in ([], ["some"], ["disable"], ["all", "a", "b"]):
+            with self.assertRaises(cb.UsageError):
+                cb.cmd_enable({}, args)
+
+    def test_enable_refuses_a_missing_directory(self):
+        with self.assertRaises(cb.CbError):
+            cb.cmd_enable({}, ["all", "absent"])
+
+    def test_disable_writes_a_disable_tag(self):
+        self.run_quietly(cb.cmd_enable, ["all"])
+        (self.base / "sub").mkdir()
+        self.run_quietly(cb.cmd_disable, ["sub"])
+        self.assertEqual((self.base / "sub" / cb.TAG_FILE).read_text(), "disable\n")
+        self.assertFalse(cb.is_enabled(str(self.base / "sub")))
+
+    def test_untag_removes_the_tag(self):
+        self.run_quietly(cb.cmd_enable, ["all"])
+        self.run_quietly(cb.cmd_untag, [])
+        self.assertFalse((self.base / cb.TAG_FILE).exists())
+
+    def test_untag_leaves_a_parent_tag_alone(self):
+        self.run_quietly(cb.cmd_enable, ["all"])
+        (self.base / "sub").mkdir()
+        with self.assertRaises(cb.CbError):
+            cb.cmd_untag({}, ["sub"])
+        self.assertTrue((self.base / cb.TAG_FILE).exists())
+
+    def test_enabled_exits_by_the_answer(self):
+        self.assertEqual(self.run_quietly(cb.cmd_enabled, []), 1)
+        self.run_quietly(cb.cmd_enable, ["all"])
+        self.assertEqual(self.run_quietly(cb.cmd_enabled, []), 0)
+
+    def test_the_words_are_subcommands(self):
+        for word in ("enable", "disable", "untag", "enabled"):
+            self.assertEqual(cb.pick_subcommand([word])[0], word)
 
 
 def flag_values(argv, flag):
@@ -1153,7 +1264,7 @@ class CmdRunTest(unittest.TestCase):
         for name, value in (
             ("current_workspace", lambda: self.workspace),
             ("settings_path", lambda path: settings),
-            ("roots", lambda: [self.tmp.name]),
+            ("is_enabled", lambda path: True),
             ("ensure_image", lambda: None),
             ("check_docker_feature", lambda docker: None),
             ("ensure_claude_dir", lambda: None),
@@ -1193,7 +1304,7 @@ class CmdRunTest(unittest.TestCase):
         self.assertEqual(self.replaced, [])
 
     def test_gate_applies_on_every_run(self):
-        cb.roots = lambda: ["/nowhere"]
+        cb.is_enabled = lambda path: False
         with self.assertRaises(cb.UsageError):
             cb.cmd_run(self.flags(), [])
 
