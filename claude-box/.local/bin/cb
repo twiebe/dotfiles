@@ -253,6 +253,10 @@ SUBCOMMANDS = (
     "config",
     "image-config",
     "volume",
+    "enable",
+    "disable",
+    "untag",
+    "enabled",
 )
 
 # Gone with the long-lived boxes. Without this they would reach claude as a
@@ -498,36 +502,59 @@ def feature_build_args(features):
 #
 # A box bind-mounts the directory it is launched from and hands it to an agent
 # with permissions loosened, so starting one in the wrong place — $HOME, /, a
-# directory reached by a stray cd — is the expensive mistake. Checkouts live in
-# ~/git and scratch work in ~/tmp; anything else is a typo until --force says
-# otherwise, and --force is remembered per box.
+# directory reached by a stray cd — is the expensive mistake. Where boxes may
+# start is opted into per directory tree: a tag file in a directory enables it
+# and everything below, either for any directory ("all") or only for the top of
+# a git checkout ("git"), and "disable" shuts a subtree again. Anything else is
+# a typo until --force says otherwise, and --force is remembered per box.
 # ---------------------------------------------------------------------------
 
-DEFAULT_ROOTS = ("~/git", "~/tmp")
+TAG_FILE = ".CLAUDEBOXDIR.TAG"
+TAG_MODES = ("all", "git", "disable")
+ENABLE_MODES = ("all", "git")
 
 
-def roots():
-    """Where boxes may be started. CB_ROOTS overrides, colon separated."""
-    configured = os.environ.get("CB_ROOTS")
-    entries = configured.split(":") if configured else DEFAULT_ROOTS
-    return [os.path.expanduser(entry) for entry in entries if entry]
+def find_tag(path):
+    """(directory, mode) of the nearest tag at or above `path`, or None.
 
-
-def in_roots(path, allowed):
-    """Is `path` one of `allowed`, or below one?
-
-    Compares resolved paths, so a symlinked ~/git — or a cd through one — still
-    counts, and a root that does not exist simply never matches. The separator
-    in the prefix test is what keeps ~/gitignored from passing as ~/git.
+    The nearest one wins, so a "git" tag in a subtree narrows an "all" further
+    up, the other way round, and "disable" overrides either. The walk follows the path as spelled, like cd
+    does: a tag in ~ still governs a checkout under a symlinked ~/git. A tag
+    with anything but a known mode in it is an error rather than a refusal, so
+    a typo in it does not read like a missing tag.
     """
-    here = os.path.realpath(path)
-    for root in allowed:
-        if not os.path.isdir(root):
-            continue
-        resolved = os.path.realpath(root)
-        if here == resolved or here.startswith(resolved.rstrip(os.sep) + os.sep):
-            return True
-    return False
+    here = os.path.abspath(path)
+    while True:
+        tag = os.path.join(here, TAG_FILE)
+        if os.path.isfile(tag):
+            with open(tag) as handle:
+                mode = handle.read().strip()
+            if mode not in TAG_MODES:
+                raise UsageError(
+                    "{}: unknown mode {!r} (known: {})".format(
+                        tag, mode, " ".join(TAG_MODES)
+                    )
+                )
+            return here, mode
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+
+
+def is_enabled(path):
+    """May a box start in `path`?
+
+    Under "git" the directory itself has to hold the .git — a file counts too,
+    which is what worktrees and submodules have — so a subdirectory of a
+    checkout is refused like any other non-checkout.
+    """
+    found = find_tag(path)
+    if found is None or found[1] == "disable":
+        return False
+    if found[1] == "git":
+        return os.path.exists(os.path.join(path, ".git"))
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1447,13 +1474,13 @@ def box_mounts(workspace, specs):
 
 
 def check_gate(workspace, force):
-    """Refuse to start a box outside the roots."""
-    if force or in_roots(workspace, roots()):
+    """Refuse to start a box where no tag enables it."""
+    if force or is_enabled(workspace):
         return
     raise UsageError(
         "refusing to start a claude box in {}\n"
-        "boxes belong under {} — pass --force to override".format(
-            workspace, " or ".join(roots())
+        "{} — run `cb enable all|git [DIR]` or pass --force".format(
+            workspace, enabled_status(workspace)
         )
     )
 
@@ -1788,6 +1815,85 @@ def cmd_mount(flags, args):
     return 0
 
 
+ENABLE_USAGE = "usage: cb enable all|git [DIR]"
+
+
+def tag_target(args, usage):
+    """The directory a tag command acts on: its only argument, or here."""
+    if len(args) > 1:
+        raise UsageError(usage)
+    workspace = current_workspace()
+    return resolve_path(args[0], workspace) if args else workspace
+
+
+def write_tag(target, mode):
+    if not os.path.isdir(target):
+        raise CbError("not a directory: " + target)
+    tag = os.path.join(target, TAG_FILE)
+    with open(tag, "w") as handle:
+        handle.write(mode + "\n")
+    print("{} ({})".format(tag, mode))
+
+
+def enabled_status(path):
+    """One line on whether and why a box may start in `path`."""
+    found = find_tag(path)
+    if found is None:
+        return "no {} here or above".format(TAG_FILE)
+    where, mode = found
+    tag = os.path.join(where, TAG_FILE)
+    if mode == "disable":
+        return "disabled by " + tag
+    if is_enabled(path):
+        return "enabled by {} ({})".format(tag, mode)
+    return "{} ({}) only enables git checkouts, and this is none".format(tag, mode)
+
+
+def cmd_enable(flags, args):
+    """`cb enable all|git [DIR]`: write the tag that lets boxes start in DIR.
+
+    The mode is required rather than defaulted, so `cb enable git` can never be
+    read as "enable the directory called git": a directory named after a mode
+    is spelled ./git.
+    """
+    if not args or args[0] not in ENABLE_MODES:
+        raise UsageError(ENABLE_USAGE)
+    write_tag(tag_target(args[1:], ENABLE_USAGE), args[0])
+    return 0
+
+
+def cmd_disable(flags, args):
+    """`cb disable [DIR]`: a "disable" tag, which beats any tag further up."""
+    write_tag(tag_target(args, "usage: cb disable [DIR]"), "disable")
+    return 0
+
+
+def cmd_untag(flags, args):
+    """`cb untag [DIR]`: remove DIR's own tag, so the one further up applies.
+
+    Only DIR's: a tag further up is somebody else's decision for a whole tree,
+    so it is pointed out rather than touched.
+    """
+    target = tag_target(args, "usage: cb untag [DIR]")
+    tag = os.path.join(target, TAG_FILE)
+    if not os.path.isfile(tag):
+        raise CbError("no {} in {}\n{}".format(TAG_FILE, target, enabled_status(target)))
+    os.remove(tag)
+    print("removed " + tag)
+    print(enabled_status(target))
+    return 0
+
+
+def cmd_enabled(flags, args):
+    """`cb enabled [DIR]`: whether a box may start in DIR, and which tag says so.
+
+    Exits 1 when it may not, so it reads as a test in a script.
+    """
+    target = tag_target(args, "usage: cb enabled [DIR]")
+    print("{}: {}".format(target, enabled_status(target)))
+    return 0 if is_enabled(target) else 1
+
+
 VOLUME_TARGETS = ("all", "playwright")
 
 
@@ -1905,19 +2011,24 @@ USAGE = """usage: cb [command] [options]
   cb volume prune playwright
                            empty the browser cache every box shares
   cb volume prune all      that, plus the shell history of checkouts that are gone
+  cb enable all|git [DIR]  let boxes start in DIR (default: here) and below it;
+                           git: only at the top of a git checkout
+  cb disable [DIR]         keep boxes out of DIR and below, whatever is above
+  cb untag [DIR]           remove DIR's tag; the one further up applies again
+  cb enabled [DIR]         whether a box may start in DIR, and why
 
 options
   -v, --volume SRC[:DST][:ro]
                            mount SRC for this run; DST defaults to
                            /workspaces/<name of SRC>
   --docker, --no-docker    give the box its own docker daemon; remembered
-  --force                  allow a box outside {roots}; remembered
+  --force                  allow a box where no tag enables it; remembered
   -y                       do not ask
   --dry-run                print the commands instead of running them
   --                       stop reading options; the rest is claude's
 
 image features: {features}
-""".format(roots=" and ".join(DEFAULT_ROOTS), features=" ".join(IMAGE_FEATURES))
+""".format(features=" ".join(IMAGE_FEATURES))
 
 
 def reject_extra(command, args):
@@ -1940,6 +2051,10 @@ COMMANDS = {
     "config": cmd_config,
     "image-config": cmd_image_config,
     "volume": cmd_volume,
+    "enable": cmd_enable,
+    "disable": cmd_disable,
+    "untag": cmd_untag,
+    "enabled": cmd_enabled,
 }
 
 

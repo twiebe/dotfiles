@@ -20,6 +20,10 @@ _cb() {
     'config:show or set this box'"'"'s settings'
     'image-config:show or set the image'"'"'s toolchains'
     'volume:prune the volumes cb keeps'
+    'enable:let boxes start in a directory and below it'
+    'disable:keep boxes out of a directory and below it'
+    'untag:remove a directory'"'"'s tag again'
+    'enabled:whether a box may start in a directory'
   )
   features=(docker ffmpeg go kubernetes pandoc playwright-deps python rust sqlx tofu)
 
@@ -31,7 +35,14 @@ _cb() {
   fi
 
   case "${words[2]}" in
-    ls) _directories ;;
+    ls|disable|untag|enabled) (( CURRENT == 3 )) && _directories ;;
+    enable)
+      if (( CURRENT == 3 )); then
+        _values 'mode' 'all' 'git'
+      elif (( CURRENT == 4 )); then
+        _directories
+      fi
+      ;;
     exec)
       if (( CURRENT == 3 )); then
         _values 'option' '-n'
