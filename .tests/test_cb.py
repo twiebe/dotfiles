@@ -385,8 +385,8 @@ class FeatureFlagsTest(unittest.TestCase):
         self.assertEqual((overrides["go"], rest), (True, []))
 
     def test_without_disables(self):
-        overrides, _ = cb.extract_feature_flags(["--without-playwright"])
-        self.assertIs(overrides["playwright"], False)
+        overrides, _ = cb.extract_feature_flags(["--without-playwright-deps"])
+        self.assertIs(overrides["playwright-deps"], False)
 
     def test_leaves_other_arguments_alone(self):
         _, rest = cb.extract_feature_flags(["--no-cache", "--without-go"])
@@ -407,8 +407,9 @@ class ResolveFeaturesTest(unittest.TestCase):
     def test_dockerfile_defaults_match(self):
         dockerfile = (CB_PATH.parents[2] / ".config" / "claude-box" / "Dockerfile").read_text()
         for feature in cb.IMAGE_FEATURES:
-            self.assertIn("ARG WITH_{}=0".format(feature.upper()), dockerfile)
-            self.assertNotIn("ARG WITH_{}=1".format(feature.upper()), dockerfile)
+            arg = "WITH_" + feature.upper().replace("-", "_")
+            self.assertIn("ARG {}=0".format(arg), dockerfile)
+            self.assertNotIn("ARG {}=1".format(arg), dockerfile)
 
     def test_stored_answer_is_remembered(self):
         features = cb.resolve_features(stored={"go": False}, overrides={})
@@ -774,9 +775,9 @@ class ImageConfigTest(unittest.TestCase):
             self.image_config("rust", "yes")
 
     def test_rebuild_image_uses_what_was_set(self):
-        self.image_config("playwright", "false")
+        self.image_config("playwright-deps", "false")
         features = cb.resolve_features(self.stored(), {})
-        self.assertFalse(features["playwright"])
+        self.assertFalse(features["playwright-deps"])
         self.assertFalse(features["tofu"])
 
 
