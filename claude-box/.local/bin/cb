@@ -257,6 +257,7 @@ SUBCOMMANDS = (
     "disable",
     "untag",
     "enabled",
+    "mv",
 )
 
 # Gone with the long-lived boxes. Without this they would reach claude as a
@@ -1990,6 +1991,278 @@ def orphaned_history_volumes():
 
 
 # ---------------------------------------------------------------------------
+# Moving a checkout
+#
+# Everything cb keeps about a directory is keyed by its path: the settings file
+# is named after the path hash, the history volume too and carries the path as
+# its label, remembered mounts name their source by path, and Claude's own
+# per-project state is keyed by the workspace folder, which is the slug of the
+# basename. A plain mv leaves all of that with the old path, where `cb config
+# --prune` and `cb volume prune all` eventually throw it away. `cb mv` moves it
+# along.
+#
+# Directories below the one moved are boxes of their own and move with it.
+# ---------------------------------------------------------------------------
+
+MV_USAGE = "usage: cb mv SRC DST"
+
+
+def relocate(path, source, target):
+    """`path` after `source` has been moved to `target`, or None if the move
+    does not touch it."""
+    if path == source or path.startswith(source.rstrip("/") + "/"):
+        return target + path[len(source):]
+    return None
+
+
+def mv_paths(args, workspace):
+    """(source, target) of `cb mv SRC DST`, checked before anything moves.
+
+    An existing DST is a directory to move into, as with mv. Anything already
+    at the final target is refused rather than replaced.
+    """
+    if len(args) != 2:
+        raise UsageError(MV_USAGE)
+    source = resolve_path(args[0], workspace)
+    target = resolve_path(args[1], workspace)
+    if os.path.isdir(target):
+        target = os.path.join(target, os.path.basename(source))
+
+    if not os.path.isdir(source):
+        raise CbError("not a directory: " + source)
+    if source == "/" or relocate(target, source, source) is not None:
+        raise UsageError("cannot move {} into itself".format(source))
+    if os.path.lexists(target):
+        raise CbError("already exists: " + target)
+    if not os.path.isdir(os.path.dirname(target)):
+        raise CbError("no such directory: " + os.path.dirname(target))
+    if "," in target:
+        raise UsageError(
+            "cannot move to {}: docker reads a comma in a --mount path as the "
+            "end of the field, so no box could start there".format(target)
+        )
+    return source, target
+
+
+def moved_mounts(specs, source, target):
+    """Remembered mounts with sources under `source` pointed at `target`.
+
+    A target that was the default for its source follows the source, so the
+    mount keeps landing where the moved checkout's own box would put it.
+    """
+    updated = []
+    for mount in [parse_mount(str(spec), "/") for spec in specs]:
+        src, dst, readonly = mount
+        new_src = relocate(src, source, target)
+        if new_src is not None:
+            if dst == workspace_folder(src):
+                dst = workspace_folder(new_src)
+            mount = (new_src, dst, readonly)
+        updated.append(format_mount(mount))
+    return updated
+
+
+def settings_moves(source, target):
+    """(old file, new file, contents) for every settings file the move changes.
+
+    That is the files of the moved directories, which change name, and those
+    of any other box with a remembered mount from inside them, which keep it.
+    A file already at the new name belongs to a directory that does not exist,
+    since the target does not, and is overwritten.
+    """
+    directory = os.path.join(state_dir(), "projects")
+    moves = []
+    for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+        path = os.path.join(directory, name)
+        stored = read_json(path)
+        if not stored:
+            continue
+        updated = dict(stored)
+        new_path = path
+        workspace = relocate(stored.get("path") or "", source, target)
+        if workspace is not None:
+            updated["path"] = workspace
+            new_path = settings_path(workspace)
+        specs = stored.get("mounts") or []
+        if not isinstance(specs, list):
+            raise CbError("{}: mounts must be a list".format(path))
+        if specs:
+            updated["mounts"] = moved_mounts(specs, source, target)
+        if updated != stored:
+            moves.append((path, new_path, updated))
+    return moves
+
+
+def history_volumes():
+    """(name, folder) of every cb-history-* volume; folder is "" without a
+    label. The name filter matches anywhere in the name, hence the prefix check."""
+    out = capture(
+        [
+            "docker", "volume", "ls",
+            "--filter", "name=cb-history-",
+            "--format", '{{.Name}}\t{{.Label "%s"}}' % FOLDER_LABEL,
+        ]
+    )
+    if out is None:
+        raise CbError("docker is not answering — is the daemon running?")
+    volumes = []
+    for line in out.splitlines():
+        name, _, folder = line.partition("\t")
+        if name.startswith("cb-history-"):
+            volumes.append((name, folder))
+    return volumes
+
+
+def history_moves(volumes, source, target):
+    """(old volume, new volume, new folder) for the history of every moved box.
+
+    docker cannot rename a volume, so each one is copied into a new volume and
+    removed. The labelled ones are found by their label; the source's own is
+    also found by name, which covers one from before the label existed.
+    """
+    moves = {}
+    for name, folder in volumes:
+        new_folder = relocate(folder, source, target) if folder else None
+        if new_folder is not None:
+            moves[name] = new_folder
+    own = history_volume(source)
+    if own not in moves and any(name == own for name, _ in volumes):
+        moves[own] = target
+
+    existing = {name for name, _ in volumes}
+    result = []
+    for old, folder in sorted(moves.items()):
+        new = history_volume(folder)
+        if new in existing:
+            raise CbError(
+                "{} already exists for {}; remove it first".format(new, folder)
+            )
+        result.append((old, new, folder))
+    return result
+
+
+def copy_volume_argv(old, new):
+    """Copy everything in volume `old` into volume `new`, owners and all.
+
+    A throwaway container from cb's image, for the reason empty_volume_argv
+    gives.
+    """
+    return [
+        "docker", "run", "--rm",
+        "--mount", "type=volume,source={},target=/from".format(old),
+        "--mount", "type=volume,source={},target=/to".format(new),
+        "--entrypoint", "cp",
+        CB_IMAGE,
+        "-a", "/from/.", "/to/",
+    ]
+
+
+def claude_project_dir(folder):
+    """Where Claude Code keeps transcripts and memory for `folder`, on the host.
+
+    Claude names the directory after the path with everything but letters and
+    digits turned into dashes.
+    """
+    return os.path.join(
+        HOST_CLAUDE_DIR, "projects", re.sub(r"[^a-zA-Z0-9]", "-", folder)
+    )
+
+
+def claude_project_move(volumes, source, target):
+    """(old dir, new dir) of Claude's project state, None, or a reason string.
+
+    Only the top of the move can change its workspace folder: everything below
+    keeps its basename. The state stays where it is when the folder does not
+    change, when there is none, when the new folder already has state of its
+    own, or when another checkout shares the old folder — the same basename
+    elsewhere is the same project to Claude, and its history is not this
+    move's to take.
+    """
+    old_folder, new_folder = workspace_folder(source), workspace_folder(target)
+    if old_folder == new_folder:
+        return None
+    old, new = claude_project_dir(old_folder), claude_project_dir(new_folder)
+    if not os.path.isdir(old):
+        return None
+    if os.path.exists(new):
+        return "{} already exists; Claude's history stays in {}".format(new, old)
+    sharing = sorted(
+        folder for _, folder in volumes
+        if folder
+        and relocate(folder, source, target) is None
+        and workspace_folder(folder) == old_folder
+    )
+    if sharing:
+        return "{} is shared with {}; Claude's history stays there".format(
+            old, " ".join(sharing)
+        )
+    return old, new
+
+
+def move_path(old, new):
+    if DRY_RUN:
+        print("+ mv {} {}".format(shlex.quote(old), shlex.quote(new)))
+        return
+    try:
+        os.rename(old, new)
+    except OSError as error:
+        raise CbError("cannot move {} to {}: {}".format(old, new, error.strerror))
+
+
+def remove_file(path):
+    if DRY_RUN:
+        print("+ rm " + shlex.quote(path))
+        return
+    os.remove(path)
+
+
+def cmd_mv(flags, args):
+    """`cb mv SRC DST`: move a directory and everything cb keeps about it.
+
+    Everything is worked out before the directory moves, so a broken settings
+    file or a taken volume name stops the move instead of half-finishing it. A
+    running box of the directory or below is refused: it would keep writing to
+    the old history volume and carry the old folder label until it exits.
+    """
+    source, target = mv_paths(args, current_workspace())
+    busy = sorted(
+        name for name, _, folder in running_boxes()
+        if relocate(folder, source, target) is not None
+    )
+    if busy:
+        raise CbError("running claude boxes in {}: {}".format(source, " ".join(busy)))
+
+    settings = settings_moves(source, target)
+    volumes = history_volumes()
+    histories = history_moves(volumes, source, target)
+    claude = claude_project_move(volumes, source, target)
+
+    move_path(source, target)
+    print("moved {} -> {}".format(source, target))
+
+    for old, new, stored in settings:
+        write_json(new, stored)
+        if new != old:
+            remove_file(old)
+        print("settings: " + new)
+
+    for old, new, folder in histories:
+        ensure_history_volume(folder)
+        run(copy_volume_argv(old, new), quiet=True)
+        run(["docker", "volume", "rm", old], quiet=True)
+        print("history:  {} -> {}".format(old, new))
+
+    if isinstance(claude, tuple):
+        move_path(*claude)
+        print("claude:   " + claude[1])
+    elif claude:
+        print("claude:   " + claude)
+
+    print(enabled_status(target))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -2016,6 +2289,8 @@ USAGE = """usage: cb [command] [options]
   cb disable [DIR]         keep boxes out of DIR and below, whatever is above
   cb untag [DIR]           remove DIR's tag; the one further up applies again
   cb enabled [DIR]         whether a box may start in DIR, and why
+  cb mv SRC DST            move a directory along with its settings, mounts,
+                           shell history and Claude history
 
 options
   -v, --volume SRC[:DST][:ro]
@@ -2055,6 +2330,7 @@ COMMANDS = {
     "disable": cmd_disable,
     "untag": cmd_untag,
     "enabled": cmd_enabled,
+    "mv": cmd_mv,
 }
 
 
