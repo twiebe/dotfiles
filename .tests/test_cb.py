@@ -1643,3 +1643,206 @@ class FormatTableTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelocateTest(unittest.TestCase):
+    def test_the_moved_directory_itself(self):
+        self.assertEqual(cb.relocate("/a/repo", "/a/repo", "/b/new"), "/b/new")
+
+    def test_a_directory_below_it(self):
+        self.assertEqual(cb.relocate("/a/repo/sub", "/a/repo", "/b/new"), "/b/new/sub")
+
+    def test_a_shared_prefix_is_not_below(self):
+        self.assertIsNone(cb.relocate("/a/repo2", "/a/repo", "/b/new"))
+
+
+class MvCommandTest(unittest.TestCase):
+    """`cb mv` end to end: the directory on disk, the settings store and Claude's
+    project directory for real, docker recorded rather than run."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = self.tmp.name
+        self.source = os.path.join(root, "old")
+        self.target = os.path.join(root, "new")
+        self.lib = os.path.join(self.source, "lib")
+        os.makedirs(self.lib)
+        self.commands = []
+        self.boxes = []
+        self.volumes = []
+
+        def record(argv, quiet=False, check=True):
+            self.commands.append(list(argv))
+            return 0
+
+        def fake_capture(argv):
+            if argv[:3] == ["docker", "volume", "ls"]:
+                return "".join("{}\t{}\n".format(*v) for v in self.volumes)
+            raise AssertionError(argv)
+
+        for name, value in (
+            ("current_workspace", lambda: root),
+            ("run", record),
+            ("capture", fake_capture),
+            ("running_boxes", lambda: self.boxes),
+            ("HOST_CLAUDE_DIR", os.path.join(root, "claude")),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+        state = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = os.path.join(root, "state")
+        self.addCleanup(
+            lambda: os.environ.pop("XDG_STATE_HOME")
+            if state is None
+            else os.environ.__setitem__("XDG_STATE_HOME", state)
+        )
+
+    def mv(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cb.cmd_mv({"yes": False}, list(args))
+        return out.getvalue()
+
+    def test_moves_the_directory(self):
+        self.mv("old", "new")
+        self.assertTrue(os.path.isdir(os.path.join(self.target, "lib")))
+        self.assertFalse(os.path.exists(self.source))
+
+    def test_moves_into_an_existing_directory(self):
+        os.mkdir(self.target)
+        self.mv("old", "new")
+        self.assertTrue(os.path.isdir(os.path.join(self.target, "old", "lib")))
+
+    def test_moves_the_settings_file_and_its_path(self):
+        cb.save_settings(cb.settings_path(self.source), {"docker": True}, self.source)
+        self.mv("old", "new")
+        self.assertFalse(os.path.exists(cb.settings_path(self.source)))
+        stored = cb.load_settings(cb.settings_path(self.target))
+        self.assertEqual(stored["path"], self.target)
+        self.assertIs(stored["docker"], True)
+
+    def test_moves_the_settings_of_a_box_below(self):
+        cb.save_settings(cb.settings_path(self.lib), {"force": True}, self.lib)
+        self.mv("old", "new")
+        moved = os.path.join(self.target, "lib")
+        self.assertEqual(cb.load_settings(cb.settings_path(moved))["path"], moved)
+
+    def test_follows_a_mount_from_inside_in_another_box(self):
+        other = os.path.join(self.tmp.name, "other")
+        cb.save_settings(
+            cb.settings_path(other),
+            {"mounts": [cb.format_mount((self.lib, "/workspaces/lib", True))]},
+            other,
+        )
+        self.mv("old", "new")
+        self.assertEqual(
+            cb.stored_mounts(cb.load_settings(cb.settings_path(other))),
+            [(os.path.join(self.target, "lib"), "/workspaces/lib", True)],
+        )
+
+    def test_a_default_mount_target_follows_its_source(self):
+        other = os.path.join(self.tmp.name, "other")
+        cb.save_settings(
+            cb.settings_path(other),
+            {"mounts": [cb.format_mount((self.source, "/workspaces/old", False))]},
+            other,
+        )
+        self.mv("old", "new")
+        self.assertEqual(
+            cb.stored_mounts(cb.load_settings(cb.settings_path(other))),
+            [(self.target, "/workspaces/new", False)],
+        )
+
+    def test_leaves_unrelated_settings_alone(self):
+        other = os.path.join(self.tmp.name, "other")
+        cb.save_settings(cb.settings_path(other), {"docker": True}, other)
+        before = os.path.getmtime(cb.settings_path(other))
+        self.mv("old", "new")
+        self.assertEqual(os.path.getmtime(cb.settings_path(other)), before)
+
+    def test_copies_the_history_volume_and_removes_the_old_one(self):
+        old = cb.history_volume(self.source)
+        self.volumes = [(old, self.source), ("cb-history-ffff", "/elsewhere")]
+        self.mv("old", "new")
+        new = cb.history_volume(self.target)
+        self.assertEqual(
+            self.commands,
+            [
+                ["docker", "volume", "create", "--label",
+                 "cb.folder=" + self.target, new],
+                cb.copy_volume_argv(old, new),
+                ["docker", "volume", "rm", old],
+            ],
+        )
+
+    def test_finds_an_unlabelled_history_by_name(self):
+        old = cb.history_volume(self.source)
+        self.volumes = [(old, "")]
+        self.mv("old", "new")
+        self.assertIn(["docker", "volume", "rm", old], self.commands)
+
+    def test_refuses_a_taken_history_volume_before_moving(self):
+        self.volumes = [
+            (cb.history_volume(self.source), self.source),
+            (cb.history_volume(self.target), "/gone"),
+        ]
+        with self.assertRaises(cb.CbError):
+            self.mv("old", "new")
+        self.assertTrue(os.path.isdir(self.source))
+
+    def test_refuses_while_a_box_runs_below(self):
+        self.boxes = [("cb-lib-1234-abcd", "1 minute ago", self.lib)]
+        with self.assertRaises(cb.CbError):
+            self.mv("old", "new")
+        self.assertTrue(os.path.isdir(self.source))
+
+    def test_refuses_an_existing_target(self):
+        os.makedirs(os.path.join(self.target, "old"))
+        with self.assertRaises(cb.CbError):
+            self.mv("old", "new")
+
+    def test_refuses_a_move_into_itself(self):
+        with self.assertRaises(cb.UsageError):
+            self.mv("old", "old/lib/deeper")
+
+    def test_refuses_a_missing_source(self):
+        with self.assertRaises(cb.CbError):
+            self.mv("nope", "new")
+
+    def test_needs_two_arguments(self):
+        with self.assertRaises(cb.UsageError):
+            self.mv("old")
+
+    def test_moves_claudes_project_directory_with_the_folder(self):
+        old = cb.claude_project_dir("/workspaces/old")
+        os.makedirs(old)
+        self.mv("old", "new")
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.isdir(cb.claude_project_dir("/workspaces/new")))
+
+    def test_keeps_claudes_project_directory_when_another_checkout_shares_it(self):
+        old = cb.claude_project_dir("/workspaces/old")
+        os.makedirs(old)
+        self.volumes = [("cb-history-ffff", "/elsewhere/old")]
+        out = self.mv("old", "new")
+        self.assertTrue(os.path.isdir(old))
+        self.assertIn("shared", out)
+
+    def test_keeps_claudes_project_directory_when_the_new_one_exists(self):
+        old = cb.claude_project_dir("/workspaces/old")
+        os.makedirs(old)
+        os.makedirs(cb.claude_project_dir("/workspaces/new"))
+        self.mv("old", "new")
+        self.assertTrue(os.path.isdir(old))
+
+    def test_dry_run_changes_nothing(self):
+        cb.save_settings(cb.settings_path(self.source), {"docker": True}, self.source)
+        self.addCleanup(setattr, cb, "DRY_RUN", False)
+        cb.DRY_RUN = True
+        self.mv("old", "new")
+        self.assertTrue(os.path.isdir(self.source))
+        self.assertTrue(os.path.exists(cb.settings_path(self.source)))
+
+    def test_is_a_subcommand(self):
+        self.assertEqual(cb.pick_subcommand(["mv", "a", "b"]), ("mv", ["a", "b"]))

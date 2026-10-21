@@ -24,6 +24,7 @@ _cb() {
     'disable:keep boxes out of a directory and below it'
     'untag:remove a directory'"'"'s tag again'
     'enabled:whether a box may start in a directory'
+    'mv:move a directory along with what cb keeps about it'
   )
   features=(docker ffmpeg go kubernetes pandoc playwright-deps python rust sqlx tofu)
 
@@ -36,6 +37,7 @@ _cb() {
 
   case "${words[2]}" in
     ls|disable|untag|enabled) (( CURRENT == 3 )) && _directories ;;
+    mv) (( CURRENT <= 4 )) && _directories ;;
     enable)
       if (( CURRENT == 3 )); then
         _values 'mode' 'all' 'git'
