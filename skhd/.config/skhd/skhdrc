@@ -1,4 +1,5 @@
 hyper - a : open -a Calendar
+hyper - b : open -a "Photo Booth"
 hyper - e : open -a "Google Chrome"
 hyper - g : open -a Notes
 hyper - h : open -a /Users/thomas/Applications/Home\ Assistant.app
