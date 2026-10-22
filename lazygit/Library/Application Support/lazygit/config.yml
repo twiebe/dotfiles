@@ -1,6 +1,13 @@
 git:
   autoFetch: false
   overrideGpg: true
+  # `|` cycles through these; the first is the one lazygit starts with.
+  diffRenderers:
+    - type: rawGit
+      args: [--color-words]
+      name: words
+    - type: rawGit
+      name: lines
 update:
   method: never
 keybinding:
