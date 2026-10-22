@@ -2179,10 +2179,12 @@ def copy_volume_argv(old, new):
     """Copy everything in volume `old` into volume `new`, owners and all.
 
     A throwaway container from cb's image, for the reason empty_volume_argv
-    gives.
+    gives. As root, because the image runs as node and a volume fresh from
+    `docker volume create` belongs to root: node can neither write into it nor
+    hand it the old one's owner, and only root can keep node's files node's.
     """
     return [
-        "docker", "run", "--rm",
+        "docker", "run", "--rm", "--user", "root",
         "--mount", "type=volume,source={},target=/from".format(old),
         "--mount", "type=volume,source={},target=/to".format(new),
         "--entrypoint", "cp",

@@ -1853,6 +1853,11 @@ class MvCommandTest(unittest.TestCase):
             ],
         )
 
+    def test_copies_the_history_as_root(self):
+        # The image runs as node; the new volume belongs to root.
+        argv = cb.copy_volume_argv("old", "new")
+        self.assertEqual(argv[argv.index("--user") + 1], "root")
+
     def test_finds_an_unlabelled_history_by_name(self):
         old = cb.history_volume(self.source)
         self.volumes = [(old, "")]
