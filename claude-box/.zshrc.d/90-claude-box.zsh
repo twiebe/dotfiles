@@ -30,7 +30,8 @@ _cb() {
 
   if (( CURRENT == 2 )); then
     _describe -t commands 'cb command' subcommands
-    _values 'option' '--docker' '--no-docker' '--force' '--dry-run' '--help' \
+    _values 'option' '--docker' '--no-docker' '--ssh-agent' '--no-ssh-agent' \
+      '--force' '--dry-run' '--help' \
       '-v' '--volume'
     return
   fi
@@ -65,7 +66,13 @@ _cb() {
       _values 'option' '--no-cache' \
         ${^features/#/--with-} ${^features/#/--without-}
       ;;
-    config) _values 'setting' 'docker' 'force' '--prune' ;;
+    config)
+      if (( CURRENT == 3 )); then
+        _values 'setting' 'docker' 'force' 'ssh-agent' '--prune'
+      elif (( CURRENT == 4 )); then
+        _values 'value' 'true' 'false'
+      fi
+      ;;
     image-config)
       if (( CURRENT == 3 )); then
         _values 'feature' $features

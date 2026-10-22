@@ -120,8 +120,9 @@ def container_name(path):
 # Settings
 #
 # One file per box, remembering the answers that would otherwise have to be
-# repeated on every invocation. Flag beats file beats default, and the flag
-# that wins is also written back, so `cb --docker` once is permanent.
+# repeated on every invocation. Flag beats file beats default. Only `cb config`
+# writes the file: a flag on the command line is an answer for that run alone,
+# so trying `cb --docker` once leaves the next bare `cb` as it was.
 #
 # The store lives under XDG_STATE_HOME and not next to the Dockerfile, because
 # that directory is stowed: stow folds a directory it alone owns into a single
@@ -135,6 +136,7 @@ SETTINGS_VERSION = 1
 SETTINGS_DEFAULTS = {
     "docker": False,
     "force": False,
+    "ssh-agent": False,
 }
 
 
@@ -158,8 +160,8 @@ def write_json(path, data):
     """Write `data` to `path`, unless this is a dry run.
 
     The check belongs here rather than at each call site: --dry-run promises to
-    change nothing, and remembering --docker while printing the command it did
-    not run would break that quietly.
+    change nothing, and `cb config docker true` writing the file while printing
+    that it would would break that quietly.
     """
     if DRY_RUN:
         print("+ write " + str(path))
@@ -280,6 +282,8 @@ TOGGLE_FLAGS = {
     "--docker": ("docker", True),
     "--no-docker": ("docker", False),
     "--force": ("force", True),
+    "--ssh-agent": ("ssh-agent", True),
+    "--no-ssh-agent": ("ssh-agent", False),
 }
 SWITCH_FLAGS = {
     "-y": "yes",
@@ -352,6 +356,7 @@ def extract_flags(args):
     flags = {
         "docker": None,
         "force": None,
+        "ssh-agent": None,
         "yes": False,
         "dry_run": False,
         "help": False,
@@ -507,7 +512,8 @@ def feature_build_args(features):
 # start is opted into per directory tree: a tag file in a directory enables it
 # and everything below, either for any directory ("all") or only for the top of
 # a git checkout ("git"), and "disable" shuts a subtree again. Anything else is
-# a typo until --force says otherwise, and --force is remembered per box.
+# a typo until --force says otherwise, for one run or, through `cb config
+# force true`, for every run of that box.
 # ---------------------------------------------------------------------------
 
 TAG_FILE = ".CLAUDEBOXDIR.TAG"
@@ -1101,6 +1107,17 @@ CB_ENTRY = "/usr/local/bin/cb-entry"
 # itself, and Claude Code reads them to decide what it may draw.
 PASSTHROUGH_ENV = ("TERM_PROGRAM", "LC_TERMINAL")
 
+# Where a box that asked for it finds the host's ssh agent. The socket is
+# forwarded rather than the keys copied, so the keys stay in the agent and a
+# box without the setting has no way to reach them.
+BOX_SSH_AUTH_SOCK = "/run/ssh-agent.sock"
+
+# OrbStack and Docker Desktop both run the containers in a VM, out of reach of
+# a socket on the Mac's filesystem, and both offer the Mac's agent inside that
+# VM at this path instead. It is not a path on the Mac: docker resolves it in
+# the VM, so it cannot be checked from here.
+MAC_SSH_AUTH_SOCK = "/run/host-services/ssh-auth.sock"
+
 def workspace_folder(workspace):
     """Where the checkout is mounted inside the box.
 
@@ -1305,7 +1322,24 @@ def container_env(docker):
     return env
 
 
-def run_argv(workspace, docker, mounts, command, tty=None, suffix=None):
+def ssh_agent_socket():
+    """The host-side source to bind for a box that asked for the ssh agent.
+
+    Only the Mac is known: anywhere else the socket and how it reaches a
+    container differ, and a box that silently starts without the agent it was
+    promised fails later and far less clearly than one that refuses here.
+    """
+    if sys.platform == "darwin":
+        return MAC_SSH_AUTH_SOCK
+    raise UsageError(
+        "--ssh-agent is only supported on macOS so far (this is {})".format(
+            sys.platform
+        )
+    )
+
+
+def run_argv(workspace, docker, mounts, command, tty=None, suffix=None,
+             agent_socket=None):
     """The whole of a box, as one `docker run`.
 
     --rm and the command in the foreground: the box lives exactly as long as
@@ -1318,6 +1352,9 @@ def run_argv(workspace, docker, mounts, command, tty=None, suffix=None):
 
     --privileged is what lets dockerd inside the box mount, write cgroups and
     program iptables, so only a box that asked for docker gets those rights.
+
+    `agent_socket` is the host's ssh agent socket, from ssh_agent_socket(), or
+    None for a box that has no business signing anything.
 
     The tty is asked for rather than assumed, and TERM forwarded with it — see
     exec_argv.
@@ -1369,8 +1406,13 @@ def run_argv(workspace, docker, mounts, command, tty=None, suffix=None):
         argv += ["--mount", "type=volume,source={},target={}".format(source, target)]
     for mount in mounts:
         argv += ["--mount", mount_value(mount)]
+    if agent_socket:
+        argv += ["--mount", mount_value((agent_socket, BOX_SSH_AUTH_SOCK, False))]
 
-    for key, value in container_env(docker).items():
+    env = container_env(docker)
+    if agent_socket:
+        env["SSH_AUTH_SOCK"] = BOX_SSH_AUTH_SOCK
+    for key, value in env.items():
         argv += ["--env", "{}={}".format(key, value)]
 
     return argv + [CB_IMAGE, CB_ENTRY] + list(command)
@@ -1435,21 +1477,11 @@ def hand_over(name, command):
 
 
 def box_settings(workspace, flags):
-    """This box's effective settings, and the overrides that shaped them.
-
-    Resolving and remembering are two steps so that nothing is written before
-    the gate has had its say — a directory cb refuses to start in must not be
-    left with a settings file behind it.
-    """
-    overrides = {"docker": flags["docker"], "force": flags["force"]}
+    """This box's effective settings: the stored ones, with this run's flags
+    on top. Nothing is written back — that is `cb config`'s job."""
+    overrides = {key: flags[key] for key in SETTINGS_DEFAULTS}
     stored = load_settings(settings_path(workspace))
-    return resolve_settings(stored, overrides), overrides
-
-
-def remember(workspace, overrides):
-    """Persist whatever the flags decided, so the next run needs no flags."""
-    if any(value is not None for value in overrides.values()):
-        save_settings(settings_path(workspace), overrides, workspace)
+    return resolve_settings(stored, overrides)
 
 
 def stored_mounts(stored):
@@ -1506,21 +1538,23 @@ def check_docker_feature(docker):
 def start(flags, command):
     """A fresh box for the current directory, running `command`.
 
-    The gate applies every time, since every run creates a container; --force
-    is remembered per workspace, so that costs one flag once.
+    The gate applies every time, since every run creates a container;
+    `cb config force true` is how a box skips it for good.
     """
     workspace = current_workspace()
-    settings, overrides = box_settings(workspace, flags)
+    settings = box_settings(workspace, flags)
     docker = settings["docker"][0]
 
     check_gate(workspace, settings["force"][0])
     mounts = box_mounts(workspace, flags["volumes"])
-    remember(workspace, overrides)
+    agent_socket = ssh_agent_socket() if settings["ssh-agent"][0] else None
     ensure_image()
     check_docker_feature(docker)
     ensure_claude_dir()
     ensure_history_volume(workspace)
-    replace_process(run_argv(workspace, docker, mounts, command))
+    replace_process(
+        run_argv(workspace, docker, mounts, command, agent_socket=agent_socket)
+    )
     return 0
 
 
@@ -1637,21 +1671,21 @@ def cmd_config(flags, args):
     settings = resolve_settings(load_settings(settings_path(workspace)), {})
     for key in sorted(settings):
         value, source = settings[key]
-        print("{:<8} {:<6} ({})".format(key, str(value).lower(), source))
+        print("{:<9} {:<6} ({})".format(key, str(value).lower(), source))
 
     mounts = stored_mounts(load_settings(settings_path(workspace)))
-    print("{:<8} {:<6} (cb mount ls)".format("mounts", len(mounts)))
+    print("{:<9} {:<6} (cb mount ls)".format("mounts", len(mounts)))
 
     features = image_features()
     if features is None:
-        print("\nimage    {} is not built".format(CB_IMAGE))
+        print("\nimage     {} is not built".format(CB_IMAGE))
     else:
         enabled = sorted(name for name, on in features.items() if on) or ["none"]
-        print("\nimage    {}  {}".format(CB_IMAGE, " ".join(enabled)))
+        print("\nimage     {}  {}".format(CB_IMAGE, " ".join(enabled)))
         versions = image_versions()
         if versions:
             print(
-                "         "
+                "          "
                 + "  ".join(
                     "{} {}".format(name, versions[name]) for name in sorted(versions)
                 )
@@ -2296,11 +2330,16 @@ options
   -v, --volume SRC[:DST][:ro]
                            mount SRC for this run; DST defaults to
                            /workspaces/<name of SRC>
-  --docker, --no-docker    give the box its own docker daemon; remembered
-  --force                  allow a box where no tag enables it; remembered
+  --docker, --no-docker    give the box its own docker daemon
+  --ssh-agent, --no-ssh-agent
+                           hand the box the host's ssh agent (macOS only)
+  --force                  allow a box where no tag enables it
   -y                       do not ask
   --dry-run                print the commands instead of running them
   --                       stop reading options; the rest is claude's
+
+  --docker, --ssh-agent and --force apply to this run only;
+  `cb config KEY true|false` keeps them for every run here
 
 image features: {features}
 """.format(features=" ".join(IMAGE_FEATURES))

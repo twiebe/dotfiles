@@ -219,8 +219,8 @@ class SettingsRoundTripTest(unittest.TestCase):
 
 
 class DryRunTest(unittest.TestCase):
-    """--dry-run prints what would happen. A run that still remembers --docker
-    has changed something, which is exactly what it promised not to do."""
+    """--dry-run prints what would happen. A `cb config` that still writes the
+    file has changed something, which is exactly what it promised not to do."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -317,6 +317,19 @@ class ExtractFlagsTest(unittest.TestCase):
     def test_docker_sets_the_toggle(self):
         flags, rest = cb.extract_flags(["--docker"])
         self.assertEqual((flags["docker"], rest), (True, []))
+
+    def test_ssh_agent_sets_the_toggle(self):
+        flags, rest = cb.extract_flags(["--ssh-agent"])
+        self.assertIs(flags["ssh-agent"], True)
+        self.assertEqual(rest, [])
+
+    def test_no_ssh_agent_clears_the_toggle(self):
+        flags, _ = cb.extract_flags(["--no-ssh-agent"])
+        self.assertIs(flags["ssh-agent"], False)
+
+    def test_ssh_agent_is_unset_without_the_flag(self):
+        flags, _ = cb.extract_flags([])
+        self.assertIsNone(flags["ssh-agent"])
 
     def test_no_docker_clears_the_toggle(self):
         flags, _ = cb.extract_flags(["--no-docker"])
@@ -1248,6 +1261,24 @@ class RunArgvTest(unittest.TestCase):
         with self.assertRaises(cb.UsageError):
             cb.run_argv("/home/u/git/a,b", False, [], ["zsh"], tty=False)
 
+    def test_no_ssh_agent_by_default(self):
+        self.assertFalse(any("SSH_AUTH_SOCK" in e for e in flag_values(self.argv, "--env")))
+        self.assertFalse(
+            any(cb.BOX_SSH_AUTH_SOCK in m for m in flag_values(self.argv, "--mount"))
+        )
+
+    def test_ssh_agent_mounts_the_socket_and_points_ssh_at_it(self):
+        argv = cb.run_argv(
+            self.workspace, False, [], ["zsh"], tty=False, agent_socket="/host/agent"
+        )
+        self.assertIn(
+            "type=bind,source=/host/agent,target=" + cb.BOX_SSH_AUTH_SOCK,
+            flag_values(argv, "--mount"),
+        )
+        self.assertIn(
+            "SSH_AUTH_SOCK=" + cb.BOX_SSH_AUTH_SOCK, flag_values(argv, "--env")
+        )
+
     def test_ends_with_the_image_the_entrypoint_and_the_command(self):
         self.assertEqual(self.argv[-4:], [cb.CB_IMAGE, cb.CB_ENTRY, "claude", "-c"])
 
@@ -1308,6 +1339,52 @@ class CmdRunTest(unittest.TestCase):
         cb.is_enabled = lambda path: False
         with self.assertRaises(cb.UsageError):
             cb.cmd_run(self.flags(), [])
+
+    def test_flags_apply_to_this_run_only(self):
+        # Persisting is `cb config`'s job; a flag must not change the next run.
+        self.addCleanup(setattr, cb.sys, "platform", cb.sys.platform)
+        cb.sys.platform = "darwin"
+        cb.cmd_run(self.flags(docker=True, force=True, **{"ssh-agent": True}), [])
+        self.assertIn("--privileged", self.replaced[0])
+        self.assertEqual(cb.load_settings(cb.settings_path(self.workspace)), {})
+
+    def test_stored_ssh_agent_is_used(self):
+        self.addCleanup(setattr, cb.sys, "platform", cb.sys.platform)
+        cb.sys.platform = "darwin"
+        cb.save_settings(cb.settings_path(self.workspace), {"ssh-agent": True}, self.workspace)
+        cb.cmd_run(self.flags(), [])
+        self.assertIn("SSH_AUTH_SOCK=" + cb.BOX_SSH_AUTH_SOCK, flag_values(self.replaced[0], "--env"))
+
+    def test_no_ssh_agent_flag_beats_the_stored_setting(self):
+        cb.save_settings(cb.settings_path(self.workspace), {"ssh-agent": True}, self.workspace)
+        cb.cmd_run(self.flags(**{"ssh-agent": False}), [])
+        self.assertFalse(
+            any("SSH_AUTH_SOCK" in e for e in flag_values(self.replaced[0], "--env"))
+        )
+
+    def test_ssh_agent_off_the_mac_stops_before_docker(self):
+        self.addCleanup(setattr, cb.sys, "platform", cb.sys.platform)
+        cb.sys.platform = "linux"
+        with self.assertRaises(cb.UsageError):
+            cb.cmd_run(self.flags(**{"ssh-agent": True}), [])
+        self.assertEqual(self.replaced, [])
+
+
+class SshAgentSocketTest(unittest.TestCase):
+    """Only the Mac's way to the agent is known; elsewhere a box that asked for
+    it is refused rather than started without it."""
+
+    def setUp(self):
+        self.addCleanup(setattr, cb.sys, "platform", cb.sys.platform)
+
+    def test_mac_uses_the_vms_host_service(self):
+        cb.sys.platform = "darwin"
+        self.assertEqual(cb.ssh_agent_socket(), "/run/host-services/ssh-auth.sock")
+
+    def test_linux_is_refused(self):
+        cb.sys.platform = "linux"
+        with self.assertRaises(cb.UsageError):
+            cb.ssh_agent_socket()
 
 
 class RemovedSubcommandTest(unittest.TestCase):
