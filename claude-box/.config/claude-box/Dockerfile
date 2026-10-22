@@ -111,7 +111,7 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 # Python, ffmpeg and pandoc are not in this list: each is a feature, further
 # down.
 #
-# Every entry below names the command that breaks without it. The four added
+# Every entry below names the command that breaks without it. The ones added
 # most recently:
 #   cmake    `cargo build` in any crate with a CMake-driven -sys dependency.
 #            Not a niche case: audiopus_sys, aws-lc-sys and friends all shell
@@ -128,6 +128,12 @@ ENV CLAUDE_CODE_FORCE_SYNC_OUTPUT=1
 #            a whole command or pipeline. zsh's `time` is a builtin that reports
 #            none of that, so measuring what a build or a test run actually
 #            costs otherwise means timestamping by hand.
+#   iproute2        `ss -ltnp` — which process listens on a port, when a dev
+#                   server will not start or a test cannot connect.
+#   netcat-openbsd  `nc -zv host port` — whether something answers at all,
+#                   below the protocol curl speaks.
+#   openssh-client  `git push` over ssh, with the host's agent from
+#                   `cb --ssh-agent`; without it git has no ssh to call.
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
   ca-certificates \
@@ -138,10 +144,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   git \
   git-lfs \
   git-delta \
+  iproute2 \
   jq \
   just \
   less \
   lua5.4 \
+  netcat-openbsd \
+  openssh-client \
   pkg-config \
   procps \
   sqlite3 \
