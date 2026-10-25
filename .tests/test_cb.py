@@ -1431,6 +1431,19 @@ class MountCommandTest(unittest.TestCase):
         self.mount("add", "../lib:ro")
         self.assertEqual(self.stored(), [(self.lib, "/workspaces/lib", True)])
 
+    def test_add_ro_flag_makes_it_readonly_without_a_target(self):
+        self.mount("add", "--ro", "../lib")
+        self.assertEqual(self.stored(), [(self.lib, "/workspaces/lib", True)])
+
+    def test_add_ro_flag_may_follow_the_spec(self):
+        self.mount("add", "../lib:/mnt/lib", "--ro")
+        self.assertEqual(self.stored(), [(self.lib, "/mnt/lib", True)])
+
+    def test_add_ro_flag_refuses_an_explicit_rw(self):
+        with self.assertRaises(cb.UsageError):
+            self.mount("add", "--ro", "../lib:rw")
+        self.assertEqual(self.stored(), [])
+
     def test_ls_lists_them(self):
         self.mount("add", "../lib")
         self.assertIn("/workspaces/lib", self.mount("ls"))
