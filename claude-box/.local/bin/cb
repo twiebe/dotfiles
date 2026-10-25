@@ -1812,7 +1812,9 @@ def prune_settings():
     return 0
 
 
-MOUNT_USAGE = "usage: cb mount add SRC[:DST][:ro] | cb mount rm SRC|DST | cb mount ls"
+MOUNT_USAGE = (
+    "usage: cb mount add [--ro] SRC[:DST][:ro] | cb mount rm SRC|DST | cb mount ls"
+)
 
 
 def cmd_mount(flags, args):
@@ -1820,7 +1822,13 @@ def cmd_mount(flags, args):
 
     Stored as normalised spec strings next to docker and force, so the settings
     file stays readable and hand-editable.
+
+    `add --ro` is the spec's :ro without having to spell out DST, wherever on
+    the line it is given.
     """
+    readonly = bool(args) and args[0] == "add" and "--ro" in args
+    if readonly:
+        args = [arg for arg in args if arg != "--ro"]
     workspace = current_workspace()
     path = settings_path(workspace)
     current = stored_mounts(load_settings(path))
@@ -1832,6 +1840,10 @@ def cmd_mount(flags, args):
 
     if len(args) == 2 and args[0] == "add":
         mount = parse_mount(args[1], workspace)
+        if readonly:
+            if args[1].endswith(":rw"):
+                raise UsageError("--ro contradicts {}".format(args[1]))
+            mount = mount[:2] + (True,)
         if any(existing[1] == mount[1] for existing in current):
             raise UsageError("something is already mounted at " + mount[1])
         check_targets([mount], fixed_targets(workspace))
@@ -2309,7 +2321,7 @@ USAGE = """usage: cb [command] [options]
   cb exec [-n NAME] CMD…   run CMD in a running box of this directory, or the
                            one called NAME (full name or its last 4 characters)
   cb ls [DIR]              running boxes, all or those of DIR
-  cb mount add SRC[:DST][:ro]
+  cb mount add [--ro] SRC[:DST][:ro]
   cb mount rm SRC|DST
   cb mount ls              mounts every run in this directory gets
   cb update-claude         rebuild with the newest claude-code
