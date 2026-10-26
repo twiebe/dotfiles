@@ -250,6 +250,7 @@ SUBCOMMANDS = (
     "exec",
     "shell",
     "mount",
+    "port",
     "rebuild-image",
     "update-claude",
     "config",
@@ -294,10 +295,18 @@ SWITCH_FLAGS = {
 }
 
 # Flags that take the next argument as their value. -v is also claude's
-# --version; `cb -- -v` reaches that one.
+# --version; `cb -- -v` reaches that one. --port is docker's -p, which is
+# claude's --print.
 VALUE_FLAGS = {
     "-v": "volumes",
     "--volume": "volumes",
+    "--port": "ports",
+}
+
+# What a value flag's value looks like, for the error when it is missing.
+VALUE_FORMS = {
+    "volumes": "SRC[:DST][:ro]",
+    "ports": "[IP:][HOST:]CONTAINER[/PROTO]",
 }
 
 
@@ -361,6 +370,7 @@ def extract_flags(args):
         "dry_run": False,
         "help": False,
         "volumes": [],
+        "ports": [],
     }
     rest = []
 
@@ -377,7 +387,9 @@ def extract_flags(args):
             flags[SWITCH_FLAGS[arg]] = True
         elif arg in VALUE_FLAGS:
             if not args or args[0] == "--":
-                raise UsageError("{} needs a value: SRC[:DST][:ro]".format(arg))
+                raise UsageError(
+                    "{} needs a value: {}".format(arg, VALUE_FORMS[VALUE_FLAGS[arg]])
+                )
             flags[VALUE_FLAGS[arg]].append(args.pop(0))
         else:
             rest.append(arg)
@@ -1294,6 +1306,106 @@ def require_sources(mounts):
             raise CbError("mount source does not exist: " + source)
 
 
+# ---------------------------------------------------------------------------
+# Published ports
+#
+# Ports of the box reachable from the host, given per run with --port or
+# remembered per workspace with `cb port add`. The spec is docker's own,
+# [IP:][HOST:]CONTAINER[/PROTO] with ranges allowed, and docker gives it the
+# meaning it always has: without IP the port listens on every interface of the
+# host, without HOST docker picks a free one (`docker port NAME` tells which).
+#
+# A port is an (ip, host, container, proto) tuple, ip and host "" when absent.
+# Every run of a checkout gets the remembered ones, so a second box of the same
+# checkout fails on a fixed host port that the first one holds; docker says so.
+# ---------------------------------------------------------------------------
+
+PORT_PROTOCOLS = ("tcp", "udp", "sctp")
+
+# The IP needs its dots, or brackets for IPv6: otherwise 8080:80 would read as
+# IP 8080 and container port 80.
+PORT_SPEC = re.compile(
+    r"(?:(?P<ip>\d+\.\d+\.\d+\.\d+|\[[0-9a-fA-F:.]+\]):)?"
+    r"(?:(?P<host>\d+(?:-\d+)?)?:)?"
+    r"(?P<container>\d+(?:-\d+)?)"
+    r"(?:/(?P<proto>[a-z]+))?"
+)
+
+
+def port_range(text, spec):
+    """(low, high) of "N" or "N-M", each a valid port number."""
+    low, _, high = text.partition("-")
+    low, high = int(low), int(high or low)
+    if not 1 <= low <= high <= 65535:
+        raise UsageError("not a port or port range: {} in {}".format(text, spec))
+    return low, high
+
+
+def parse_port(spec):
+    """(ip, host, container, proto) from docker's [IP:][HOST:]CONTAINER[/PROTO].
+
+    Checked here rather than left to docker so a typo in a remembered port is
+    refused by `cb port add`, not by every run after it. Two ranges have to be
+    the same length; a host range against one container port is docker's "any
+    free port of these".
+    """
+    match = PORT_SPEC.fullmatch(spec)
+    if not match:
+        raise UsageError(
+            "cannot read port {} (want [IP:][HOST:]CONTAINER[/PROTO])".format(spec)
+        )
+    ip, host, container, proto = match.group("ip", "host", "container", "proto")
+    proto = proto or "tcp"
+    if proto not in PORT_PROTOCOLS:
+        raise UsageError(
+            "unknown protocol {} in {} (known: {})".format(
+                proto, spec, " ".join(PORT_PROTOCOLS)
+            )
+        )
+    inner = port_range(container, spec)
+    if host:
+        outer = port_range(host, spec)
+        if inner[0] != inner[1] and outer[1] - outer[0] != inner[1] - inner[0]:
+            raise UsageError("port ranges differ in length: " + spec)
+    return (ip or "", host or "", container, proto)
+
+
+def format_port(port):
+    """The spec parse_port reads back, and the value of docker's --publish.
+
+    An IP without a host port keeps its empty field, which is how docker spells
+    "this interface, any port".
+    """
+    ip, host, container, proto = port
+    spec = container
+    if host or ip:
+        spec = host + ":" + spec
+    if ip:
+        spec = ip + ":" + spec
+    return spec if proto == "tcp" else spec + "/" + proto
+
+
+def port_key(port):
+    """What two ports clash on: the host side when it is fixed. One without a
+    host port takes a free one and clashes with nothing but itself."""
+    ip, host, container, proto = port
+    return (ip, host, proto) if host else port
+
+
+def merge_ports(persistent, per_run):
+    """Remembered ports, then this run's, the way merge_mounts does it: a run's
+    port on a remembered host port replaces it, two of the run's own clash."""
+    merged = {port_key(port): port for port in persistent}
+    seen = set()
+    for port in per_run:
+        key = port_key(port)
+        if key in seen:
+            raise UsageError("two ports for " + format_port(port))
+        seen.add(key)
+        merged[key] = port
+    return list(merged.values())
+
+
 def container_env(docker):
     """The environment a box starts with.
 
@@ -1339,7 +1451,7 @@ def ssh_agent_socket():
 
 
 def run_argv(workspace, docker, mounts, command, tty=None, suffix=None,
-             agent_socket=None):
+             agent_socket=None, ports=()):
     """The whole of a box, as one `docker run`.
 
     --rm and the command in the foreground: the box lives exactly as long as
@@ -1355,6 +1467,8 @@ def run_argv(workspace, docker, mounts, command, tty=None, suffix=None,
 
     `agent_socket` is the host's ssh agent socket, from ssh_agent_socket(), or
     None for a box that has no business signing anything.
+
+    `ports` are published as they are spelled, see parse_port.
 
     The tty is asked for rather than assumed, and TERM forwarded with it — see
     exec_argv.
@@ -1408,6 +1522,8 @@ def run_argv(workspace, docker, mounts, command, tty=None, suffix=None,
         argv += ["--mount", mount_value(mount)]
     if agent_socket:
         argv += ["--mount", mount_value((agent_socket, BOX_SSH_AUTH_SOCK, False))]
+    for port in ports:
+        argv += ["--publish", format_port(port)]
 
     env = container_env(docker)
     if agent_socket:
@@ -1506,6 +1622,21 @@ def box_mounts(workspace, specs):
     return mounts
 
 
+def stored_ports(stored):
+    """Remembered ports as tuples. A broken entry is an error, as with mounts:
+    a service the box was promised to be reachable on would silently not be."""
+    specs = stored.get("ports") or []
+    if not isinstance(specs, list):
+        raise CbError("settings: ports must be a list")
+    return [parse_port(str(spec)) for spec in specs]
+
+
+def box_ports(workspace, specs):
+    """Remembered ports plus this run's."""
+    persistent = stored_ports(load_settings(settings_path(workspace)))
+    return merge_ports(persistent, [parse_port(spec) for spec in specs])
+
+
 def check_gate(workspace, force):
     """Refuse to start a box where no tag enables it."""
     if force or is_enabled(workspace):
@@ -1547,13 +1678,16 @@ def start(flags, command):
 
     check_gate(workspace, settings["force"][0])
     mounts = box_mounts(workspace, flags["volumes"])
+    ports = box_ports(workspace, flags["ports"])
     agent_socket = ssh_agent_socket() if settings["ssh-agent"][0] else None
     ensure_image()
     check_docker_feature(docker)
     ensure_claude_dir()
     ensure_history_volume(workspace)
     replace_process(
-        run_argv(workspace, docker, mounts, command, agent_socket=agent_socket)
+        run_argv(
+            workspace, docker, mounts, command, agent_socket=agent_socket, ports=ports
+        )
     )
     return 0
 
@@ -1675,6 +1809,8 @@ def cmd_config(flags, args):
 
     mounts = stored_mounts(load_settings(settings_path(workspace)))
     print("{:<9} {:<6} (cb mount ls)".format("mounts", len(mounts)))
+    ports = stored_ports(load_settings(settings_path(workspace)))
+    print("{:<9} {:<6} (cb port ls)".format("ports", len(ports)))
 
     features = image_features()
     if features is None:
@@ -1777,6 +1913,8 @@ def show_setting(key):
 def set_setting(key, value):
     if key == "mounts":
         raise UsageError("mounts are set with `cb mount add|rm`")
+    if key == "ports":
+        raise UsageError("ports are set with `cb port add|rm`")
     if key not in SETTINGS_DEFAULTS:
         raise UsageError(
             "unknown setting: {} (known: {})".format(
@@ -1859,6 +1997,47 @@ def cmd_mount(flags, args):
 
     save_settings(path, {"mounts": [format_mount(m) for m in updated]}, workspace)
     print("{} mount(s) ({})".format(len(updated), path))
+    return 0
+
+
+PORT_USAGE = (
+    "usage: cb port add [IP:][HOST:]CONTAINER[/PROTO] | cb port rm SPEC|HOST "
+    "| cb port ls"
+)
+
+
+def cmd_port(flags, args):
+    """Ports remembered for this workspace, published by every run started here.
+
+    `rm` takes the spec as added, or just the host port, which is the part that
+    is typed at the browser and the one most likely remembered.
+    """
+    workspace = current_workspace()
+    path = settings_path(workspace)
+    current = stored_ports(load_settings(path))
+
+    if args == ["ls"]:
+        for port in current:
+            print(format_port(port))
+        return 0
+
+    if len(args) == 2 and args[0] == "add":
+        port = parse_port(args[1])
+        if any(port_key(existing) == port_key(port) for existing in current):
+            raise UsageError("already published: " + format_port(port))
+        updated = current + [port]
+    elif len(args) == 2 and args[0] == "rm":
+        updated = [
+            port for port in current
+            if args[1] not in (format_port(port), port[1])
+        ]
+        if len(updated) == len(current):
+            raise CbError("no port for " + args[1])
+    else:
+        raise UsageError(PORT_USAGE)
+
+    save_settings(path, {"ports": [format_port(p) for p in updated]}, workspace)
+    print("{} port(s) ({})".format(len(updated), path))
     return 0
 
 
@@ -2324,6 +2503,9 @@ USAGE = """usage: cb [command] [options]
   cb mount add [--ro] SRC[:DST][:ro]
   cb mount rm SRC|DST
   cb mount ls              mounts every run in this directory gets
+  cb port add [IP:][HOST:]CONTAINER[/PROTO]
+  cb port rm SPEC|HOST
+  cb port ls               ports every run in this directory publishes
   cb update-claude         rebuild with the newest claude-code
   cb rebuild-image [--no-cache] [--with-X|--without-X]…
   cb image-config [FEATURE [true|false]]
@@ -2344,6 +2526,8 @@ options
   -v, --volume SRC[:DST][:ro]
                            mount SRC for this run; DST defaults to
                            /workspaces/<name of SRC>
+  --port [IP:][HOST:]CONTAINER[/PROTO]
+                           publish a port for this run, as docker -p does
   --docker, --no-docker    give the box its own docker daemon
   --ssh-agent, --no-ssh-agent
                            hand the box the host's ssh agent (macOS only)
@@ -2374,6 +2558,7 @@ COMMANDS = {
     "ls": cmd_ls,
     "shell": cmd_shell,
     "mount": cmd_mount,
+    "port": cmd_port,
     "rebuild-image": cmd_rebuild_image,
     "update-claude": cmd_update_claude,
     "config": cmd_config,

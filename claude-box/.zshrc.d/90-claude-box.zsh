@@ -15,6 +15,7 @@ _cb() {
     'exec:run a command in a running box'
     'ls:list running boxes'
     'mount:remember extra mounts for this directory'
+    'port:remember published ports for this directory'
     'rebuild-image:rebuild the shared image'
     'update-claude:rebuild with the newest claude-code'
     'config:show or set this box'"'"'s settings'
@@ -32,7 +33,7 @@ _cb() {
     _describe -t commands 'cb command' subcommands
     _values 'option' '--docker' '--no-docker' '--ssh-agent' '--no-ssh-agent' \
       '--force' '--dry-run' '--help' \
-      '-v' '--volume'
+      '-v' '--volume' '--port'
     return
   fi
 
@@ -61,6 +62,9 @@ _cb() {
       elif [[ "${words[3]}" == add ]]; then
         _directories
       fi
+      ;;
+    port)
+      (( CURRENT == 3 )) && _values 'action' 'add' 'rm' 'ls'
       ;;
     rebuild-image)
       _values 'option' '--no-cache' \
