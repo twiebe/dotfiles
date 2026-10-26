@@ -387,6 +387,22 @@ class ExtractFlagsTest(unittest.TestCase):
         flags, rest = cb.extract_flags(["--", "-v"])
         self.assertEqual((flags["volumes"], rest), ([], ["-v"]))
 
+    def test_port_takes_the_next_argument_and_repeats(self):
+        flags, rest = cb.extract_flags(["--port", "8080:80", "-c", "--port", "53/udp"])
+        self.assertEqual((flags["ports"], rest), (["8080:80", "53/udp"], ["-c"]))
+
+    def test_port_without_a_value_names_the_port_form(self):
+        with self.assertRaisesRegex(cb.UsageError, "CONTAINER"):
+            cb.extract_flags(["--port"])
+
+    def test_p_stays_claudes_print(self):
+        flags, rest = cb.extract_flags(["-p", "hi"])
+        self.assertEqual((flags["ports"], rest), ([], ["-p", "hi"]))
+
+    def test_value_of_port_is_not_a_subcommand(self):
+        self.assertEqual(cb.pick_subcommand(["--port", "8080", "ls"])[0], "ls")
+        self.assertEqual(cb.pick_subcommand(["--port", "ls"])[0], "run")
+
 
 class FeatureFlagsTest(unittest.TestCase):
     def test_unmentioned_features_are_none(self):
@@ -1279,6 +1295,18 @@ class RunArgvTest(unittest.TestCase):
             "SSH_AUTH_SOCK=" + cb.BOX_SSH_AUTH_SOCK, flag_values(argv, "--env")
         )
 
+    def test_no_ports_by_default(self):
+        self.assertEqual(flag_values(self.argv, "--publish"), [])
+
+    def test_publishes_ports(self):
+        argv = cb.run_argv(
+            self.workspace, False, [], ["zsh"], tty=False,
+            ports=[("", "8080", "80", "tcp"), ("127.0.0.1", "", "53", "udp")],
+        )
+        self.assertEqual(
+            flag_values(argv, "--publish"), ["8080:80", "127.0.0.1::53/udp"]
+        )
+
     def test_ends_with_the_image_the_entrypoint_and_the_command(self):
         self.assertEqual(self.argv[-4:], [cb.CB_IMAGE, cb.CB_ENTRY, "claude", "-c"])
 
@@ -1329,6 +1357,25 @@ class CmdRunTest(unittest.TestCase):
             "type=bind,source={},target=/mnt/t".format(self.tmp.name),
             flag_values(self.replaced[0], "--mount"),
         )
+
+    def test_per_run_port_is_published(self):
+        cb.cmd_run(self.flags(ports=["3000:3000"]), [])
+        self.assertEqual(flag_values(self.replaced[0], "--publish"), ["3000:3000"])
+
+    def test_stored_ports_are_published_and_a_run_port_replaces_one(self):
+        cb.save_settings(
+            cb.settings_path(self.workspace), {"ports": ["8080:80", "9000:9000"]},
+            self.workspace,
+        )
+        cb.cmd_run(self.flags(ports=["8080:81"]), [])
+        self.assertEqual(
+            flag_values(self.replaced[0], "--publish"), ["8080:81", "9000:9000"]
+        )
+
+    def test_bad_port_stops_before_docker(self):
+        with self.assertRaises(cb.UsageError):
+            cb.cmd_run(self.flags(ports=["http"]), [])
+        self.assertEqual(self.replaced, [])
 
     def test_missing_mount_source_stops_before_docker(self):
         with self.assertRaises(cb.CbError):
@@ -1941,3 +1988,129 @@ class MvCommandTest(unittest.TestCase):
 
     def test_is_a_subcommand(self):
         self.assertEqual(cb.pick_subcommand(["mv", "a", "b"]), ("mv", ["a", "b"]))
+
+
+class ParsePortTest(unittest.TestCase):
+    """docker's -p spec, checked before docker sees it."""
+
+    def test_host_and_container(self):
+        self.assertEqual(cb.parse_port("8080:80"), ("", "8080", "80", "tcp"))
+
+    def test_container_only(self):
+        self.assertEqual(cb.parse_port("80"), ("", "", "80", "tcp"))
+
+    def test_ip_host_container_and_protocol(self):
+        self.assertEqual(
+            cb.parse_port("127.0.0.1:53:53/udp"), ("127.0.0.1", "53", "53", "udp")
+        )
+
+    def test_ip_without_host_port(self):
+        self.assertEqual(cb.parse_port("127.0.0.1::80"), ("127.0.0.1", "", "80", "tcp"))
+
+    def test_ipv6(self):
+        self.assertEqual(cb.parse_port("[::1]:8080:80"), ("[::1]", "8080", "80", "tcp"))
+
+    def test_ranges(self):
+        self.assertEqual(
+            cb.parse_port("8000-8002:9000-9002"), ("", "8000-8002", "9000-9002", "tcp")
+        )
+
+    def test_host_range_for_one_container_port(self):
+        self.assertEqual(cb.parse_port("8000-8010:80")[1], "8000-8010")
+
+    def test_refuses_ranges_of_different_length(self):
+        with self.assertRaises(cb.UsageError):
+            cb.parse_port("8000-8001:9000-9002")
+
+    def test_refuses_out_of_range_and_reversed(self):
+        for spec in ("0", "65536", "8080:70000", "90-80"):
+            with self.assertRaises(cb.UsageError, msg=spec):
+                cb.parse_port(spec)
+
+    def test_refuses_garbage_and_unknown_protocol(self):
+        for spec in ("", "http", "80:", "a:80", "1:2:3", "80/icmp"):
+            with self.assertRaises(cb.UsageError, msg=spec):
+                cb.parse_port(spec)
+
+    def test_round_trips(self):
+        for spec in ("80", "8080:80", "127.0.0.1::80", "[::1]:8080:80/udp"):
+            self.assertEqual(cb.format_port(cb.parse_port(spec)), spec)
+
+    def test_tcp_is_left_implicit(self):
+        self.assertEqual(cb.format_port(cb.parse_port("8080:80/tcp")), "8080:80")
+
+
+class MergePortsTest(unittest.TestCase):
+    def test_a_run_port_replaces_a_remembered_one_on_the_same_host_port(self):
+        merged = cb.merge_ports(
+            [cb.parse_port("8080:80")], [cb.parse_port("8080:81")]
+        )
+        self.assertEqual(merged, [cb.parse_port("8080:81")])
+
+    def test_another_protocol_is_another_port(self):
+        merged = cb.merge_ports([cb.parse_port("53:53")], [cb.parse_port("53:53/udp")])
+        self.assertEqual(len(merged), 2)
+
+    def test_two_run_ports_on_one_host_port_are_refused(self):
+        with self.assertRaises(cb.UsageError):
+            cb.merge_ports([], [cb.parse_port("8080:80"), cb.parse_port("8080:81")])
+
+
+class PortCommandTest(unittest.TestCase):
+    """Remembered ports round-trip through the per-workspace settings file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = os.path.join(self.tmp.name, "settings.json")
+        for name, value in (
+            ("current_workspace", lambda: self.tmp.name),
+            ("settings_path", lambda path: self.settings),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+
+    def port(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cb.cmd_port({"yes": False}, list(args))
+        return out.getvalue()
+
+    def stored(self):
+        return cb.load_settings(self.settings).get("ports")
+
+    def test_add_stores_the_normalised_spec(self):
+        self.port("add", "8080:80/tcp")
+        self.assertEqual(self.stored(), ["8080:80"])
+
+    def test_add_refuses_a_taken_host_port(self):
+        self.port("add", "8080:80")
+        with self.assertRaises(cb.UsageError):
+            self.port("add", "8080:81")
+
+    def test_add_refuses_garbage_and_stores_nothing(self):
+        with self.assertRaises(cb.UsageError):
+            self.port("add", "http")
+        self.assertIsNone(self.stored())
+
+    def test_ls_lists_them(self):
+        self.port("add", "8080:80")
+        self.assertEqual(self.port("ls"), "8080:80\n")
+
+    def test_rm_by_spec_or_host_port(self):
+        self.port("add", "8080:80")
+        self.port("add", "9000:9000")
+        self.port("rm", "8080:80")
+        self.port("rm", "9000")
+        self.assertEqual(self.stored(), [])
+
+    def test_rm_unknown_is_an_error(self):
+        with self.assertRaises(cb.CbError):
+            self.port("rm", "1234")
+
+    def test_config_refuses_to_set_ports(self):
+        with self.assertRaises(cb.UsageError):
+            cb.set_setting("ports", "true")
+
+    def test_is_a_subcommand(self):
+        self.assertEqual(cb.pick_subcommand(["port", "ls"]), ("port", ["ls"]))
