@@ -1,0 +1,7 @@
+# macOS-only overrides. Ghostty on macOS reads this file in addition to
+# ~/.config/ghostty/config, and settings here take precedence, so only what
+# differs from the shared config belongs here. Stow this package on macs only:
+#   stow ghostty-macos
+
+# Same point size renders smaller on macOS than on Linux.
+font-size = 13

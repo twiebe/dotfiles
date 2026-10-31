@@ -4,7 +4,8 @@ config-file = ?"theme.conf"
 # Font
 font-family = "JetBrainsMono Nerd Font"
 font-style = Regular
-font-size = 13
+# Linux size; macOS overrides it in the ghostty-macos package.
+font-size = 11
 # macOS rasterizes without the stroke thickening other Mac apps apply, which
 # makes thin stems look unantialiased. No-op on Linux.
 font-thicken = true
