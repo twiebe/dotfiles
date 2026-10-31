@@ -1263,6 +1263,15 @@ class RunArgvTest(unittest.TestCase):
             "--privileged", cb.run_argv(self.workspace, True, [], ["zsh"], tty=False)
         )
 
+    def test_no_podman_flags_by_default(self):
+        self.assertFalse(any(a.startswith("--userns") for a in self.argv))
+        self.assertNotIn("--security-opt", self.argv)
+
+    def test_rootless_podman_maps_the_host_user_onto_node(self):
+        argv = cb.run_argv(self.workspace, False, [], ["zsh"], tty=False, podman=True)
+        self.assertIn("--userns=keep-id:uid=1000,gid=1000", argv)
+        self.assertEqual(flag_values(argv, "--security-opt"), ["label=disable"])
+
     def test_tty_and_term_when_there_is_a_terminal(self):
         self.addCleanup(os.environ.pop, "TERM", None)
         os.environ["TERM"] = "xterm-ghostty"
@@ -1311,6 +1320,29 @@ class RunArgvTest(unittest.TestCase):
         self.assertEqual(self.argv[-4:], [cb.CB_IMAGE, cb.CB_ENTRY, "claude", "-c"])
 
 
+class RootlessPodmanTest(unittest.TestCase):
+    """podman-docker is told apart by what `docker --version` says."""
+
+    def answer(self, version, euid=1000):
+        self.addCleanup(setattr, cb, "capture", cb.capture)
+        cb.capture = lambda argv: version
+        self.addCleanup(setattr, cb.os, "geteuid", cb.os.geteuid)
+        cb.os.geteuid = lambda: euid
+        return cb.rootless_podman()
+
+    def test_podman_as_a_user(self):
+        self.assertTrue(self.answer("podman version 5.2.2\n"))
+
+    def test_podman_as_root(self):
+        self.assertFalse(self.answer("podman version 5.2.2\n", euid=0))
+
+    def test_docker(self):
+        self.assertFalse(self.answer("Docker version 26.1.5, build a72d7cd\n"))
+
+    def test_no_docker_answer(self):
+        self.assertFalse(self.answer(None))
+
+
 class CmdRunTest(unittest.TestCase):
     """The run path end to end, with the side effects recorded."""
 
@@ -1329,6 +1361,7 @@ class CmdRunTest(unittest.TestCase):
             ("check_docker_feature", lambda docker: None),
             ("ensure_claude_dir", lambda: None),
             ("ensure_history_volume", lambda workspace: None),
+            ("rootless_podman", lambda: False),
             ("replace_process", self.replaced.append),
         ):
             self.addCleanup(setattr, cb, name, getattr(cb, name))
