@@ -34,6 +34,16 @@ confirm-close-surface=false
 resize-overlay = never
 # Linux/GTK only, ignored on macOS
 gtk-toolbar-style = flat
+# Linux counterpart of macos-titlebar-style = hidden: drop the GTK header bar
+# but keep the window's borders, rounded corners and shadow. Unlike macOS, tabs
+# still work: the tab bar appears once there is more than one tab. Needs a
+# full restart, a config reload is not enough.
+gtk-titlebar = false
+# gtk-titlebar only removes a header bar GTK draws itself (client-side). Under
+# window-decoration = auto, KDE and other compositors that draw the titlebar
+# themselves (server-side) keep theirs, so force client-side decorations.
+# Ignored on macOS.
+window-decoration = client
 
 # Selection
 # Ghostty's default plus @, so double-click splits user@host.
