@@ -1090,6 +1090,11 @@ def ensure_image():
 # the image's node. On a Linux host with a different uid, files cb writes into
 # the checkout would land owned by 1000; add --user "$(id -u):$(id -g)" here if
 # that ever bites, and expect to fix up /home/node at the same time.
+#
+# Rootless podman (podman-docker on Fedora Atomic, Bazzite) gets neither:
+# it makes the host user root in the box and leaves node a subuid nobody on the
+# host owns, and SELinux keeps container_t out of the home directory. See
+# podman_flags().
 # ---------------------------------------------------------------------------
 
 BOX_USER = "node"
@@ -1450,8 +1455,34 @@ def ssh_agent_socket():
     )
 
 
+def rootless_podman():
+    """Whether `docker` is podman, run by a user other than root.
+
+    podman-docker installs a `docker` that is podman under that name, and says
+    so in --version. Run by root, podman maps uids one to one like docker does;
+    only the rootless case needs podman_flags().
+    """
+    version = capture(["docker", "--version"]) or ""
+    return version.lower().startswith("podman") and os.geteuid() != 0
+
+
+def podman_flags():
+    """What a box needs from rootless podman to write the host's directories.
+
+    keep-id maps the host user onto node (uid 1000 in the image) instead of
+    root, so files node writes into ~/.claude and the checkout are the host
+    user's, and files the host user owns are node's. Without it ~/.claude is
+    root's inside the box and Claude cannot save its login.
+
+    label=disable rather than :z on the bind mounts: relabelling would change
+    the SELinux context of the host's ~/.claude and of every checkout for good,
+    while a box is trusted with both anyway.
+    """
+    return ["--userns=keep-id:uid=1000,gid=1000", "--security-opt", "label=disable"]
+
+
 def run_argv(workspace, docker, mounts, command, tty=None, suffix=None,
-             agent_socket=None, ports=()):
+             agent_socket=None, ports=(), podman=False):
     """The whole of a box, as one `docker run`.
 
     --rm and the command in the foreground: the box lives exactly as long as
@@ -1469,6 +1500,9 @@ def run_argv(workspace, docker, mounts, command, tty=None, suffix=None,
     None for a box that has no business signing anything.
 
     `ports` are published as they are spelled, see parse_port.
+
+    `podman` is rootless_podman(), asked for by the caller so this stays free
+    of subprocesses.
 
     The tty is asked for rather than assumed, and TERM forwarded with it — see
     exec_argv.
@@ -1507,6 +1541,8 @@ def run_argv(workspace, docker, mounts, command, tty=None, suffix=None,
     ]
     if docker:
         argv.append("--privileged")
+    if podman:
+        argv += podman_flags()
 
     for source, target in (
         (workspace, folder),
@@ -1686,7 +1722,8 @@ def start(flags, command):
     ensure_history_volume(workspace)
     replace_process(
         run_argv(
-            workspace, docker, mounts, command, agent_socket=agent_socket, ports=ports
+            workspace, docker, mounts, command, agent_socket=agent_socket, ports=ports,
+            podman=rootless_podman(),
         )
     )
     return 0
