@@ -1145,6 +1145,30 @@ class HistoryVolumeTest(unittest.TestCase):
         )
 
 
+class EnsureHistoryVolumeTest(unittest.TestCase):
+    """podman refuses `volume create` on a name it has, so cb asks first."""
+
+    def ensure(self, inspected):
+        ran = []
+        for name, value in (
+            ("capture", lambda argv: inspected),
+            ("run", lambda argv, **kwargs: ran.append(argv)),
+        ):
+            self.addCleanup(setattr, cb, name, getattr(cb, name))
+            setattr(cb, name, value)
+        cb.ensure_history_volume("/w")
+        return ran
+
+    def test_creates_a_missing_volume_with_its_folder_label(self):
+        ran = self.ensure(None)
+        self.assertEqual(ran[0][:3], ["docker", "volume", "create"])
+        self.assertIn("{}=/w".format(cb.FOLDER_LABEL), ran[0])
+        self.assertEqual(ran[0][-1], cb.history_volume("/w"))
+
+    def test_leaves_an_existing_volume_alone(self):
+        self.assertEqual(self.ensure("[{}]"), [])
+
+
 class ContainerEnvTest(unittest.TestCase):
     """Baked in at creation time, so a later bare `cb` brings the box back up
     the way it was made."""
@@ -1849,6 +1873,9 @@ class MvCommandTest(unittest.TestCase):
         def fake_capture(argv):
             if argv[:3] == ["docker", "volume", "ls"]:
                 return "".join("{}\t{}\n".format(*v) for v in self.volumes)
+            if argv[:3] == ["docker", "volume", "inspect"]:
+                known = [name for name, _ in self.volumes]
+                return "[{}]" if argv[3] in known else None
             raise AssertionError(argv)
 
         for name, value in (

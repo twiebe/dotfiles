@@ -1169,14 +1169,18 @@ def ensure_history_volume(workspace):
 
     Every history volume is dangling between runs now, so `cb volume prune`
     needs the label to tell a gone checkout from one that is just idle.
-    `docker volume create` on an existing name is a no-op and leaves its labels
-    as they were — a volume from before this label stays unlabelled.
+    A volume that already exists is left as it was — one from before this label
+    stays unlabelled. Asked first rather than left to `docker volume create`:
+    docker treats an existing name as a no-op, podman refuses it.
     """
+    volume = history_volume(workspace)
+    if capture(["docker", "volume", "inspect", volume]) is not None:
+        return
     run(
         [
             "docker", "volume", "create",
             "--label", "{}={}".format(FOLDER_LABEL, workspace),
-            history_volume(workspace),
+            volume,
         ],
         quiet=True,
     )
