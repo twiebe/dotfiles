@@ -6,9 +6,6 @@
 # Same point size renders larger on Linux than on macOS.
 font-size = 11
 
-# keyd maps Super+C/V to Ctrl+C/V under GNOME, so the shared super+c/super+v
-# bindings never fire here. Bind the Ctrl variants instead. performable: only
-# copies when there is a selection; without one, ctrl+c still reaches the
-# shell as SIGINT.
-keybind = performable:ctrl+c=copy_to_clipboard
+# keyd maps Super+V to Ctrl+V under GNOME, so the shared super+v binding never
+# fires here. Copy needs no binding: copy-on-select already fills the clipboard.
 keybind = ctrl+v=paste_from_clipboard
