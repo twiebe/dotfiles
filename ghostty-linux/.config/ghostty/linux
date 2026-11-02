@@ -1,0 +1,14 @@
+# Linux-only overrides, pulled in by `config-file = ?"linux"` in the shared
+# config. Ghostty loads included files after the file that includes them, so
+# settings here win. Stow this package on Linux only:
+#   stow ghostty-linux
+
+# Same point size renders larger on Linux than on macOS.
+font-size = 11
+
+# keyd maps Super+C/V to Ctrl+C/V under GNOME, so the shared super+c/super+v
+# bindings never fire here. Bind the Ctrl variants instead. performable: only
+# copies when there is a selection; without one, ctrl+c still reaches the
+# shell as SIGINT.
+keybind = performable:ctrl+c=copy_to_clipboard
+keybind = ctrl+v=paste_from_clipboard
