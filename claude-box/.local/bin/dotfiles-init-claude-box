@@ -1,0 +1,21 @@
+#!/usr/bin/env zsh
+
+set -e
+
+REPO_URL="https://github.com/twiebe/claude-box.git"
+TARGET_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/claude-box"
+
+if [[ -d "${TARGET_DIR}/.git" ]]; then
+  echo "updating ${TARGET_DIR}"
+  git -C "${TARGET_DIR}" pull --ff-only
+else
+  git clone "${REPO_URL}" "${TARGET_DIR}"
+fi
+
+# claude-box used to be stowed from here. Its old ~/.config/claude-box link now
+# points at nothing; install.sh replaces the ~/.local/bin/cb one on its own.
+if [[ -L "${HOME}/.config/claude-box" && ! -e "${HOME}/.config/claude-box" ]]; then
+  rm "${HOME}/.config/claude-box"
+fi
+
+"${TARGET_DIR}/install.sh"
