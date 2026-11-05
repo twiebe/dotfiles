@@ -23,6 +23,7 @@ unset rcs rc sep
 
 test -f ~/.zshrc.local && source ~/.zshrc.local
 
+unalias fastfetch 2> /dev/null
 if which fastfetch 2>&1 >/dev/null; then
-  $(which --skip-alias fastfetch) -c archey.jsonc
+  fastfetch -c archey.jsonc
 fi
