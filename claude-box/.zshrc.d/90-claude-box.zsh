@@ -4,8 +4,12 @@
 alias cbc='cb --continue'
 
 # The voice of `say` in a box started with `cb --speak`. Without it cb falls
-# back to spd-say (say on the Mac).
-if (( $+commands[piper] && $+commands[pw-play] )) \
-    && [[ -r ~/.local/share/piper/de_DE-thorsten-high.onnx ]]; then
-  export CB_SPEAK_COMMAND="piper -m ${HOME}/.local/share/piper/de_DE-thorsten-high.onnx --output-raw 2>/dev/null | pw-play --raw --format s16 --rate 22050 --channels 1 -"
+# back to spd-say (say on the Mac). On Linux piper streams into pw-play; the
+# Mac's afplay cannot read stdin, so there piper writes a WAV file first.
+if (( $+commands[piper] )) && [[ -r ~/.local/share/piper/de_DE-thorsten-high.onnx ]]; then
+  if (( $+commands[pw-play] )); then
+    export CB_SPEAK_COMMAND="piper -m ${HOME}/.local/share/piper/de_DE-thorsten-high.onnx --output-raw 2>/dev/null | pw-play --raw --format s16 --rate 22050 --channels 1 -"
+  elif (( $+commands[afplay] )); then
+    export CB_SPEAK_COMMAND="d=\$(mktemp -d) && piper -m ${HOME}/.local/share/piper/de_DE-thorsten-high.onnx -f \"\$d/say.wav\" 2>/dev/null && afplay \"\$d/say.wav\"; rm -rf \"\$d\""
+  fi
 fi
