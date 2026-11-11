@@ -19,3 +19,22 @@ if [[ -L "${HOME}/.config/claude-box" && ! -e "${HOME}/.config/claude-box" ]]; t
 fi
 
 "${TARGET_DIR}/install.sh"
+
+# Thorsten's voice for `cb --speak` (see .zshrc.d/90-claude-box.zsh): piper as a
+# uv tool, and the voice next to where the speech command looks for it. Python
+# 3.14, since piper-tts does not install on 3.15 (yet).
+PIPER_VOICES="${HOME}/.local/share/piper"
+PIPER_VOICE="de_DE-thorsten-high"
+
+if (( $+commands[uv] )); then
+  if [[ ! -d "$(uv tool dir)/piper-tts" ]]; then
+    uv tool install --python 3.14 piper-tts
+  fi
+  if [[ ! -r "${PIPER_VOICES}/${PIPER_VOICE}.onnx" || ! -r "${PIPER_VOICES}/${PIPER_VOICE}.onnx.json" ]]; then
+    mkdir -p "${PIPER_VOICES}"
+    "$(uv tool dir)/piper-tts/bin/python3" -m piper.download_voices \
+      --data-dir "${PIPER_VOICES}" "${PIPER_VOICE}"
+  fi
+else
+  echo "uv not found, skipping piper and Thorsten's voice"
+fi
