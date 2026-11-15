@@ -25,5 +25,5 @@ test -f ~/.zshrc.local && source ~/.zshrc.local
 
 unalias fastfetch 2> /dev/null
 if which fastfetch 2>&1 >/dev/null; then
-  fastfetch -c archey.jsonc
+  fastfetch
 fi
